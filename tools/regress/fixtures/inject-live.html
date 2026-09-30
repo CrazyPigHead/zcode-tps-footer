@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>tps-footer inject live-sim regression</title>
+<!--
+  inject.js 动态机制夹具（自运行，不依赖测试框架）。
+
+  背景：静态夹具（inject-dom.html）验证的是静态 DOM 结构下的机制；本夹具补上动态维度，
+  模拟 ZCode 时间线的运行时行为（对应 D:\\Projects\\github\\ZCode\\packages\\ui\\src\\v4\\
+  ConversationTimeline.tsx）。「侧边栏闪烁」已定性为 ZCode 原生渲染行为（滚动渐隐 mask
+  全层重绘、虚拟测高跳变等），注入无法也不应去修它；本夹具的职责是回归保证**注入行
+  存在的唯一合法影响是「没有影响」**——对宿主的布局指标零贡献：
+
+    - 吸底滚动容器：内容变化即 scrollTop=scrollHeight（对齐 useLayoutEffect +
+      scrollToBottom 的跟随行为），流式期间每 tick 锚定；
+    - 流式追加：每 tick 向 live section 追加 18px 内容行 + 对已有行做文本 patch
+      （模拟 React 流式 commit 的 childList 变更，驱动 observer 调度路径）；
+    - 轮末迁移：live section 销毁，历史区以新 section 重建（React 式卸载+重挂），
+      外层 wrapper 先给估算高 300px、下一拍回填实测高（对齐 TanStack 虚拟测高的
+      estimate→measured 两段式）；
+    - layout-shift PerformanceObserver 全程记录（含 tps 开/关两阶段分别累计）。
+
+  断言（核心是 A/B 对照：同一脚本跑两遍，tps 开/关，所有布局指标必须一致）：
+    L1 流式期 scrollHeight 增量恰好 = 应用内容增量（20×18px）；注入行走字零贡献
+    L2 静默窗（应用无变更 ≥1s，仅注入行逐秒刷新）section 高度与 scrollHeight 零变化
+    L3 轮末迁移（卸载+重挂+估算高）后，行于微任务内补回新 section（同帧补画）
+    L4 迁移瞬间滚动跳变幅度：tps 开/关完全一致（注入不放大原生跳变）
+    L5 layout-shift 总分：tps 开/关均≈0（注入不产生布局位移）
+    L6 tps=false → 全部行撤除；true → 恢复（实机 A/B 开关，免重启）
+    L7 走字只改文本节点 nodeValue（节点身份不变），且静默窗内文本确有刷新
+
+  运行：任意 Chromium 打开本文件（约 8~15s 出结果）——
+    msedge --headless=new --disable-gpu --virtual-time-budget=30000 --dump-dom \
+      "file:///…/tools/regress/fixtures/inject-live.html" | grep -A20 'test-out'
+    退出码看 document.title（TPS-LIVE-TEST:PASS / :FAIL）。
+  注意：headless 虚拟时间下 rAF/interval 节拍非帧精确，断言只用确定性证据
+  （几何量、节点身份、微任务存在性），耗时段全部给足预算。
+  陷阱：滚动容器内容低于视口高时 scrollHeight 被钳制在 clientHeight，增量恒为 0，
+  L1/L4 会退化成 0=0 的假通过——夹具因此在流式前预垫 460px 内容。
+-->
+<style>
+  body { margin: 0; background: #16161a; font-family: system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<div id="scroll" style="position:relative;height:500px;overflow-y:auto">
+  <div id="history" style="position:relative"></div>
+  <div id="tail" style="position:relative"></div>
+</div>
+<script>
+  // ---- fetch 桩（必须在 inject.js 之前装好）----
+  window.__pings = [];
+  window.__tpsEnabled = true; // /turns 携带的 A/B 开关（L6 与 phase B 翻转）
+  const okJson = (o) => Promise.resolve(new Response(JSON.stringify(o),
+    { status: 200, headers: { "Content-Type": "application/json" } }));
+  window.fetch = (url) => {
+    const u = String(url);
+    if (u.indexOf("/turns") >= 0)
+      return okJson({ turns: window.__turnsFixture, tps: window.__tpsEnabled !== false });
+    if (u.indexOf("/ping") >= 0) {
+      window.__pings.push(decodeURIComponent(u));
+      return Promise.resolve(new Response("ok"));
+    }
+    return Promise.reject(new Error("unexpected fetch " + u));
+  };
+
+  // ---- layout-shift 收集（L5：记录条目与 source，供失败诊断）----
+  window.__shifts = { A: 0, B: 0 };
+  window.__shiftEntries = [];
+  try {
+    new PerformanceObserver((list) => {
+      const k = window.__shiftPhase || "A";
+      for (const e of list.getEntries()) {
+        if (e.hadRecentInput) continue;
+        window.__shifts[k] += e.value;
+        let src = "?";
+        try {
+          const n = e.sources && e.sources[0] && e.sources[0].node;
+          if (n) src = (n.tagName || n.nodeName) + (n.className ? "." + String(n.className).slice(0, 30) : "");
+        } catch {}
+        window.__shiftEntries.push(k + ":" + e.value.toFixed(4) + ":" + src);
+      }
+    }).observe({ type: "layout-shift", buffered: true });
+  } catch {}
+
+  // ---- 数据必须在 inject.js 首扫之前就位（首扫取数后有 2s TTL，晚置会导致
+  //      「线 2 秒后才出现」的假象，干扰 L3/L7）----
+  const __now = Date.now();
+  window.__turnsFixture = [
+    { turn_id: "turn_live", msg_id: "msg_live", live: true,
+      start_ms: __now - 8000, phase: "tool", tool: "Bash", tool_pending: false,
+      tool_start_ms: __now - 8000, steps: 3, turn_no: 7,
+      ttft_ms: 2100, tps: 51, models: ["GLM-5.3"] },
+  ];
+</script>
+<script src="../../../inject/inject.js"></script>
+<script>
+  // ---- 应用模拟（ZCode 时间线的运行时行为，见头部注释）----
+  const scroller = document.getElementById("scroll");
+  const historyBox = document.getElementById("history");
+  const tailBox = document.getElementById("tail");
+
+  function makeSection(id) {
+    const s = document.createElement("section");
+    s.setAttribute("data-turn-id", id);
+    // 样式取自 ConversationTurnGroup：relative flex flex-col gap-5 px-4 pb-5
+    s.style.cssText =
+      "position:relative;display:flex;flex-direction:column;gap:20px;" +
+      "padding:56px 16px 20px;margin:0 auto;max-width:760px";
+    const content = document.createElement("div");
+    s.appendChild(content);
+    return s;
+  }
+  function appendLine(sec, h) {
+    const d = document.createElement("div");
+    d.style.cssText = `height:${h}px;background:#2a2a30;border-radius:6px;color:#999;font-size:10px`;
+    d.textContent = "line";
+    sec.firstChild.appendChild(d);
+    return d;
+  }
+  function anchor() {
+    // ConversationTimeline 的吸底跟随：内容变化即瞬时 scrollTop=scrollHeight
+    scroller.scrollTop = scroller.scrollHeight;
+  }
+  /**
+   * 一轮完整回合生命周期。返回布局指标（供 A/B 对照）：
+   *   streamGrow   流式期 scrollHeight 总增量（应用内容恰 20×18=360px，注入零贡献则相等）
+   *   qDh/qDsh     静默窗内 section 高度 / scrollHeight 变化（应全 0）
+   *   migJump      轮末迁移瞬间的 scrollTop 跳变幅度
+   *   repainted    迁移重挂后行是否于微任务内补回（phase A 才有意义）
+   */
+  async function scenario() {
+    const sec = makeSection("msg_live");
+    tailBox.appendChild(sec);
+    anchor();
+    // L7 前半：记下首条线的文本节点身份（数据已预置，observer 同帧即画）
+    await Promise.resolve();
+    await Promise.resolve();
+    const line0 = sec.querySelector("[data-tps-footer]");
+    await sleep(60);
+    const line = sec.querySelector("[data-tps-footer]");
+    const tn0 = line && line.firstChild;
+    const txt0 = line && line.textContent;
+    const paintedEarly = !!line0;
+
+    // 预垫一块 460px 初始内容，让内容超过 500px 视口——scrollHeight 被视口钳制时
+    // （内容 < clientHeight）增量恒为 0，L1/L4 会退化成 0=0 的假通过
+    appendLine(sec, 460);
+    anchor();
+    await sleep(60);
+
+    // 流式：20 tick × 追加 18px + 文本 patch（childList 变更驱动 observer）
+    const sh0 = scroller.scrollHeight;
+    for (let i = 0; i < 20; i++) {
+      const d = appendLine(sec, 18);
+      d.textContent = "line " + i + " content grows";
+      anchor();
+      await sleep(60);
+    }
+    const streamGrow = scroller.scrollHeight - sh0;
+
+    // 静默窗：应用零变更 ≥1s，只有注入行在逐秒走字
+    const qH0 = sec.offsetHeight, qSH0 = scroller.scrollHeight;
+    await sleep(1300);
+    const qDh = sec.offsetHeight - qH0, qDsh = scroller.scrollHeight - qSH0;
+    const tnSame = !!(line && line.firstChild === tn0 && tn0 && tn0.nodeType === 3);
+    const txtChanged = !!(line && line.textContent !== txt0);
+
+    // 轮末迁移：live 卸载 → 历史区重建（同 turn-id 新 section）+ 估算高→实测高
+    const top0 = scroller.scrollTop;
+    sec.remove();
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "position:relative;height:300px;overflow:hidden";
+    const sec2 = makeSection("msg_live");
+    for (let j = 0; j < 20; j++) appendLine(sec2, 18);
+    wrap.appendChild(sec2);
+    historyBox.appendChild(wrap);
+    anchor();
+    await Promise.resolve();
+    await Promise.resolve();
+    const repainted = !!sec2.querySelector("[data-tps-footer]");
+    await sleep(120);
+    wrap.style.height = "auto";
+    anchor();
+    const migJump = Math.abs(scroller.scrollTop - top0);
+    return { streamGrow, qDh, qDsh, migJump, repainted, tnSame, txtChanged, paintedEarly };
+  }
+
+  // ---- 断言执行器（与 inject-dom.html 同构）----
+  window.__results = [];
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const check = (name, pass, info) => window.__results.push({ name, pass: !!pass, info: info || "" });
+  const noLine = () => !document.querySelector("[data-tps-footer]");
+
+  async function run() {
+    try {
+      check("loaded/脚本已加载", window.__tpsFooterLoaded === true,
+        "相对路径须为 ../../../inject/inject.js，路径错则后续全挂");
+      if (!window.__tpsFooterLoaded) return;
+
+      // ---- Phase A：tps 开，完整回合 ----
+      window.__shiftPhase = "A";
+      const A = await scenario();
+      check("L0/新挂载即有线（数据预置路径）", A.paintedEarly,
+        "数据先于挂载就位时，observer 微任务内同帧画线");
+      check("L1/流式期增量全来自应用内容", A.streamGrow === 20 * 18,
+        "streamGrow=" + A.streamGrow + "（期望 " + 20 * 18 + "）");
+      check("L2/静默窗零布局变化", A.qDh === 0 && A.qDsh === 0,
+        "Δsection=" + A.qDh + " ΔscrollHeight=" + A.qDsh);
+      check("L3/迁移重挂后微任务内补回", A.repainted,
+        "轮末 live→history 重挂（含估算高两段式）下同帧补画仍成立");
+      check("L7/走字原地改 nodeValue", A.tnSame && A.txtChanged,
+        "node same=" + A.tnSame + " text changed=" + A.txtChanged);
+
+      // ---- L6：A/B 开关（免重启撤线/恢复）----
+      window.__tpsEnabled = false;
+      let t = performance.now();
+      while (performance.now() - t < 3500 && !noLine()) await sleep(50);
+      check("L6/tps=false 撤掉全部行", noLine(), "");
+      window.__tpsEnabled = true;
+      t = performance.now();
+      while (performance.now() - t < 3500 && noLine()) await sleep(50);
+      check("L6/tps=true 恢复补画", !noLine(), "");
+
+      // ---- Phase B：tps 关，同一脚本重跑（A/B 对照）----
+      window.__tpsEnabled = false;
+      t = performance.now();
+      while (performance.now() - t < 3500 && !noLine()) await sleep(50);
+      historyBox.innerHTML = "";
+      tailBox.innerHTML = "";
+      window.__shiftPhase = "B";
+      const B = await scenario();
+      check("L4/迁移跳变开/关一致", Math.abs(A.migJump - B.migJump) <= 0.5,
+        "on=" + A.migJump.toFixed(1) + " off=" + B.migJump.toFixed(1) +
+        "（注入不放大原生跳变）");
+      check("L4/流式增量开/关一致", A.streamGrow === B.streamGrow,
+        "on=" + A.streamGrow + " off=" + B.streamGrow);
+      check("L5/layout-shift 开/关均≈0", window.__shifts.A <= 0.01 && window.__shifts.B <= 0.01,
+        "on=" + window.__shifts.A.toFixed(4) + " off=" + window.__shifts.B.toFixed(4) +
+        (window.__shiftEntries.length ? " entries=" + window.__shiftEntries.join(" ; ").slice(0, 300) : ""));
+      window.__tpsEnabled = true; // 收尾还原
+    } catch (e) {
+      check("runner-exception", false, String((e && e.stack) || e));
+    } finally {
+      const pass = window.__results.every((r) => r.pass);
+      document.title = pass ? "TPS-LIVE-TEST:PASS" : "TPS-LIVE-TEST:FAIL";
+      let out = document.getElementById("test-out");
+      if (!out) {
+        out = document.createElement("pre");
+        out.id = "test-out";
+        out.style.color = "#ccc";
+        document.body.appendChild(out);
+      }
+      out.textContent = document.title + "\n" +
+        window.__results.map((r) => (r.pass ? "PASS " : "FAIL ") + r.name + (r.info ? "  | " + r.info : "")).join("\n");
+    }
+  }
+  setTimeout(run, 0);
+</script>
+</body>
+</html>

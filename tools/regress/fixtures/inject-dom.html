@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>tps-footer inject dom regression</title>
+<!--
+  inject.js 渲染层 DOM 回归夹具（自运行，不依赖测试框架）
+
+  模拟 ZCode 时间线的关键结构：历史区轮次容器（absolute wrapper + 动态测高目标）、
+  live tail 容器（relative），section 样式取自 ConversationTurnGroup
+  （relative flex flex-col gap-5 px-4 @md:px-6 pb-5）。fetch 桩在 inject.js 之前
+  装好：/turns 回放夹具回合，/ping 记录上报。
+
+  运行：任意 Chromium 打开本文件，约 2s 后取结果——
+    # 免依赖驱动（本仓库回归用这个）
+    msedge --headless=new --disable-gpu --virtual-time-budget=20000 --dump-dom \
+      "file:///…/tools/regress/fixtures/inject-dom.html" | grep -A25 'test-out'
+    # 或交互式
+    playwright-cli open "file:///…/tools/regress/fixtures/inject-dom.html"
+    playwright-cli --raw eval "JSON.stringify(window.__results)"
+  退出码看 document.title（TPS-DOM-TEST:PASS / :FAIL）；无 node/测试框架依赖。
+
+  覆盖点（对应 inject.js 防闪烁三阶段）：
+    A 统计行绝对定位且完全落在 section 的 pb-5 padding 盒内、与内容列对齐；
+      追加行前后 section 高度零变化；文本走字也不改高度。
+    B 新挂载 section 在 observer 微任务（先于本帧上屏）内同帧补画——行与 section
+      本体同帧出现，无「缺线一帧」空窗；即画即终态（无过渡）。
+    C 数据晚到的补画同样即画即终态：opacity 直接 0.55、无 transition、无定时器
+      （旧版 120ms 淡入 + 300ms 兜底是每轮一次的可见闪变源，已整体移除）。
+    D 走字只改文本节点 nodeValue（节点身份不变，不删旧建新）；
+      /turns 的 tps 开关：false 撤掉全部行，true 恢复（实机 A/B 免重启）。
+-->
+<style>
+  body { margin: 0; background: #16161a; font-family: system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<div id="scroll" style="position:relative;height:600px;overflow-y:auto">
+  <!-- 历史区：轮次 wrapper（absolute，ZCode 在它上挂 measureElement） -->
+  <div data-v4-turn-unit="1" data-index="0" style="position:absolute;left:0;top:0;width:100%">
+    <section data-turn-id="msg_a" data-turn-key="k_a"
+      style="position:relative;display:flex;flex-direction:column;gap:20px;padding:56px 16px 20px;margin:0 auto;max-width:760px">
+      <div style="height:80px;background:#2a2a30;color:#ddd;border-radius:8px;padding:12px">历史回答 A</div>
+    </section>
+  </div>
+  <!-- live tail：relative 容器（不参与虚拟测高） -->
+  <div data-v4-running-live-tail="1" style="position:relative;margin-top:460px">
+    <section data-turn-id="msg_b" data-turn-key="k_b"
+      style="position:relative;display:flex;flex-direction:column;gap:20px;padding:56px 16px 20px;margin:0 auto;max-width:760px">
+      <div style="height:80px;background:#2a2a30;color:#ddd;border-radius:8px;padding:12px">运行中回答 B</div>
+    </section>
+  </div>
+</div>
+<script>
+  // ---- fetch 桩（必须在 inject.js 之前装好）----
+  window.__pings = [];
+  window.__tpsEnabled = true; // /turns 携带的 A/B 开关（D 组翻转）
+  // rAF 计数桩：B 阶段用它证明 observer 对新挂载调度了 rAF 补画（与时钟无关的确定性证据）
+  window.__rafCount = 0;
+  const __origRaf = window.requestAnimationFrame.bind(window);
+  window.requestAnimationFrame = (cb) => { window.__rafCount++; return __origRaf(cb); };
+  const now = Date.now();
+  window.__turnsFixture = [
+    { turn_id: "turn_aaa", msg_id: "msg_a", live: false,
+      start_ms: now - 8 * 60000, end_ms: now - 60000, run_ms: 460000,
+      steps: 12, turn_no: 8, ttft_ms: 7000, tps: 49, models: ["GLM-5.3"] },
+    { turn_id: "turn_bbb", msg_id: "msg_b", live: true,
+      start_ms: now - 45000, phase: "tool", tool: "Bash", tool_pending: false,
+      tool_start_ms: now - 12000, steps: 6, turn_no: 9,
+      ttft_ms: 2800, tps: 51, models: ["GLM-5.3"] },
+    // 预置给「动态挂载新 section」阶段用：初始取数就带上，避开 2s TTL 缓存
+    { turn_id: "turn_ccc", msg_id: "msg_x", live: false,
+      start_ms: now - 300000, end_ms: now - 120000, run_ms: 180000,
+      steps: 3, turn_no: 4, ttft_ms: 4200, tps: 47, models: ["GLM-5.3"] },
+  ];
+  window.fetch = (url) => {
+    const u = String(url);
+    if (u.indexOf("/turns") >= 0) {
+      return Promise.resolve(new Response(JSON.stringify(
+        { turns: window.__turnsFixture, tps: window.__tpsEnabled !== false }),
+        { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (u.indexOf("/ping") >= 0) {
+      window.__pings.push(decodeURIComponent(u));
+      return Promise.resolve(new Response("ok"));
+    }
+    return Promise.reject(new Error("unexpected fetch " + u));
+  };
+</script>
+<script src="../../../inject/inject.js"></script>
+<script>
+  // ---- 断言执行器 ----
+  window.__results = [];
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const check = (name, pass, info) => window.__results.push({ name, pass: !!pass, info: info || "" });
+
+  async function run() {
+    try {
+      check("ininject/脚本已加载", window.__tpsFooterLoaded === true,
+        "相对路径须为 ../../../inject/inject.js，路径错则后续全挂");
+      if (!window.__tpsFooterLoaded) return;
+      await sleep(300); // 首扫 + rAF 补画 + 淡入完成
+      const secA = document.querySelector('section[data-turn-id="msg_a"]');
+      const secB = document.querySelector('section[data-turn-id="msg_b"]');
+      const lineA = secA.querySelector("[data-tps-footer]");
+      const lineB = secB.querySelector("[data-tps-footer]");
+
+      check("A/行存在且绝对定位", lineA && lineB &&
+        getComputedStyle(lineA).position === "absolute" &&
+        getComputedStyle(lineB).position === "absolute",
+        lineA ? "pos=" + getComputedStyle(lineA).position : "line 缺失");
+      check("A/静态行文本", lineA && lineA.textContent.includes("第8轮·12步") &&
+        lineA.textContent.includes("49 tok/s"), lineA && lineA.textContent);
+      check("A/live 行文本", lineB && lineB.textContent.includes("第9轮") &&
+        lineB.textContent.includes("终端 运行中") && lineB.textContent.includes("tok/s"),
+        lineB && lineB.textContent);
+
+      const inPad = (sec, line) => {
+        const lr = line.getBoundingClientRect(), sr = sec.getBoundingClientRect();
+        const pb = parseFloat(getComputedStyle(sec).paddingBottom);
+        return lr.top >= sr.bottom - pb - 0.6 && lr.bottom <= sr.bottom + 0.6;
+      };
+      check("A/行完全落在 pb-5 盒内", lineA && lineB && inPad(secA, lineA) && inPad(secB, lineB),
+        lineA ? "A:" + JSON.stringify(lineA.getBoundingClientRect()).slice(0, 120) : "");
+      check("A/与内容列对齐(padding-inline:inherit)", lineA &&
+        parseFloat(getComputedStyle(lineA).paddingLeft) === parseFloat(getComputedStyle(secA).paddingLeft) &&
+        parseFloat(getComputedStyle(lineA).paddingRight) === parseFloat(getComputedStyle(secA).paddingRight),
+        lineA ? "line=" + getComputedStyle(lineA).paddingLeft + " sec=" + getComputedStyle(secA).paddingLeft : "");
+
+      // ---- B：新挂载 section 同帧补画（observer 微任务先于本帧上屏）+ 零布局 delta ----
+      const tail = document.querySelector('[data-v4-running-live-tail]');
+      const sec = document.createElement("section");
+      sec.setAttribute("data-turn-id", "msg_x");
+      sec.setAttribute("data-turn-key", "k_x");
+      sec.style.cssText = "position:relative;display:flex;flex-direction:column;gap:20px;padding:56px 16px 20px;margin:0 auto;max-width:760px";
+      sec.innerHTML = '<div style="height:60px;background:#2a2a30;color:#ddd;border-radius:8px;padding:12px">新挂载回答 X</div>';
+      tail.appendChild(sec);
+      const h0 = sec.offsetHeight; // 同步读：此刻注入行必然还没画（observer 是异步的）
+      // 两个微任务后行必须已在：MutationObserver 回调是微任务、先于浏览器把本次挂载
+      // 画上屏 → 统计行与 section 本体同帧出现，无「缺线一帧」空窗。老 rAF 路径要等
+      // 下一帧，重挂载时行会肉眼可见地消失又淡入（用户反馈的残留闪烁）。
+      await Promise.resolve();
+      await Promise.resolve();
+      const lineX = sec.querySelector("[data-tps-footer]");
+      const h1 = sec.offsetHeight;
+      check("B/同帧补画", !!lineX,
+        "observer 回调（微任务）先于本帧上屏，行与 section 同帧出现");
+      check("B/同帧补画即终态", lineX && lineX.style.opacity === "0.55" && lineX.style.transition === "",
+        "inline opacity=" + (lineX && lineX.style.opacity) +
+        " transition=" + JSON.stringify(lineX && lineX.style.transition));
+      check("B/追加行零布局 delta", h0 === h1, "h0=" + h0 + " h1=" + h1);
+      check("B/行文本匹配预置回合", lineX && lineX.textContent.includes("第4轮·3步") &&
+        lineX.textContent.includes("47 tok/s"), lineX && lineX.textContent);
+      check("B/无 INVISIBLE 上报", !window.__pings.some((p) => p.includes("secs=-2")),
+        "pings=" + window.__pings.length);
+
+      // ---- C：数据晚到的补画（section 已上屏、线后到）——即画即终态，无任何过渡 ----
+      const sec2 = document.createElement("section");
+      sec2.setAttribute("data-turn-id", "msg_late");
+      sec2.setAttribute("data-turn-key", "k_late");
+      sec2.style.cssText = "position:relative;display:flex;flex-direction:column;gap:20px;padding:56px 16px 20px;margin:0 auto;max-width:760px";
+      sec2.innerHTML = '<div style="height:60px;background:#2a2a30;color:#ddd;border-radius:8px;padding:12px">晚到数据回答 L</div>';
+      tail.appendChild(sec2);
+      await sleep(300); // rAF scan 走一轮（缓存无数据）：确认没画
+      check("C/数据未到时不画线", !sec2.querySelector("[data-tps-footer]"), "");
+      window.__turnsFixture.push({ turn_id: "turn_ddd", msg_id: "msg_late", live: false,
+        start_ms: now - 60000, end_ms: now - 30000, run_ms: 30000,
+        steps: 1, turn_no: 5, ttft_ms: 900, tps: 60, models: ["GLM-5.3"] });
+      // 夹具有 live 条目 → 取数 TTL=700ms：下一个 1s 兜底扫描必取到新数据并补画
+      let lineL = null;
+      const lt0 = performance.now();
+      while (performance.now() - lt0 < 2500) {
+        await sleep(30);
+        lineL = sec2.querySelector("[data-tps-footer]");
+        if (lineL) break;
+      }
+      check("C/数据到达后补画", !!lineL,
+        "elapsed≈" + Math.round(performance.now() - lt0) + "ms");
+      check("C/补画即画即终态（无淡入无过渡）", lineL &&
+        lineL.style.opacity === "0.55" && lineL.style.transition === "" &&
+        getComputedStyle(lineL).opacity === "0.55",
+        "inline=" + (lineL && lineL.style.opacity) +
+        " computed=" + (lineL && getComputedStyle(lineL).opacity) +
+        " transition=" + JSON.stringify(lineL && lineL.style.transition));
+
+      // ---- D：走字原地改 nodeValue + tps 开关 A/B ----
+      // live 行（msg_b）逐秒刷新：文本在变，但文本节点身份不变（textContent 整写会删旧建新）
+      const liveLine = secB.querySelector("[data-tps-footer]");
+      const liveTn = liveLine && liveLine.firstChild;
+      const liveTxt0 = liveLine && liveLine.textContent;
+      const d0 = performance.now();
+      while (performance.now() - d0 < 2000 && liveLine.textContent === liveTxt0) await sleep(50);
+      check("D/走字原地变更文本节点", liveLine && liveLine.firstChild === liveTn &&
+        liveTn.nodeType === 3 && liveLine.textContent !== liveTxt0,
+        "text changed=" + (liveLine.textContent !== liveTxt0) +
+        " node same=" + (liveLine.firstChild === liveTn));
+
+      // A/B 开关：false → 撤掉全部行；true → 恢复（fetch 桩即时生效，等一个取数周期）
+      window.__tpsEnabled = false;
+      const off0 = performance.now();
+      while (performance.now() - off0 < 3500 &&
+        document.querySelector("[data-tps-footer]")) await sleep(50);
+      check("D/tps=false 撤掉全部行", !document.querySelector("[data-tps-footer]"), "");
+      window.__tpsEnabled = true;
+      const on0 = performance.now();
+      while (performance.now() - on0 < 3500 &&
+        !document.querySelector("[data-tps-footer]")) await sleep(50);
+      check("D/tps=true 恢复补画", !!document.querySelector("[data-tps-footer]"), "");
+
+      // ---- A 补充：文本走字不改高度 ----
+      const h2 = sec.offsetHeight;
+      lineX.textContent = "x".repeat(400); // 超长串：若仍在流内会撑高/换行
+      check("A/文本走字零高度变化", sec.offsetHeight === h2,
+        "h2=" + h2 + " h3=" + sec.offsetHeight);
+      // 留下的超长文本由下一个 1s 兜底扫描按文本比较自愈（顺便覆盖恢复路径）
+    } catch (e) {
+      check("runner-exception", false, String(e && e.stack || e));
+    } finally {
+      const pass = window.__results.every((r) => r.pass);
+      document.title = pass ? "TPS-DOM-TEST:PASS" : "TPS-DOM-TEST:FAIL";
+      // 结果镜像进 DOM：headless --dump-dom 驱动方式（无测试框架/无 node 依赖）从这里取
+      let out = document.getElementById("test-out");
+      if (!out) {
+        out = document.createElement("pre");
+        out.id = "test-out";
+        document.body.appendChild(out);
+      }
+      out.textContent = document.title + "\n" +
+        window.__results.map((r) => (r.pass ? "PASS " : "FAIL ") + r.name + (r.info ? "  | " + r.info : "")).join("\n");
+    }
+  }
+  setTimeout(run, 0);
+</script>
+</body>
+</html>

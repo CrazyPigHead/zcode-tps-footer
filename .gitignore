@@ -1,0 +1,10 @@
+# 运行时产物（logs/ 为日志）
+logs/
+tools/regress/superdata/
+
+# Python 字节码
+__pycache__/
+*.py[cod]
+
+# ZCode 会话本地计划
+.zcode/plans/
