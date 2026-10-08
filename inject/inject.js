@@ -2,6 +2,7 @@
  * ZCode 每答统计行注入脚本（Windows + Remote SSH 版）
  *
  * 样式：`14:05 · 第9轮·4步 · 终端 运行中 45秒 · 用时 3分04秒 · 首 token 4.2秒 · 51 tok/s · GLM-5.3`
+ * 时长分级（fmtDur）：秒 → 分+秒 → 时+分+秒 → 天+时+分+秒 → 年+天+时+分+秒（年按 365 天折算）
  * 子会话（subagent/workflow_child）条目在模型名前多一段 `上下文 126K (63%)`——官方容量表
  * 只挂在主会话输入栏工具条（composer 工具条），只读子面板没有 composer 摆不下，这里补上。
  *
@@ -140,11 +141,23 @@
     }
   }
 
+  // 五级时长，每级都精确到秒：秒 → 分+秒 → 时+分+秒 → 天+时+分+秒 →
+  // 年+天+时+分+秒（按 365 天/年折算），大单位整数 + 两位补零小单位
   function fmtDur(ms) {
-    const t = Math.max(0, Math.floor(ms / 1000));
-    const m = Math.floor(t / 60);
+    const t = Math.max(0, Math.floor((ms || 0) / 1000)); // 兜底字段缺失/NaN：否则五级比较全落空，落到年级行输出 NaN年…
+    if (t < 60) return `${t}秒`;
+    const p = (n) => String(n).padStart(2, "0");
     const s = t % 60;
-    return m > 0 ? `${m}分${String(s).padStart(2, "0")}秒` : `${t}秒`;
+    const m = Math.floor(t / 60);
+    if (m < 60) return `${m}分${p(s)}秒`;
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    if (h < 24) return `${h}时${p(mm)}分${p(s)}秒`;
+    const d = Math.floor(h / 24);
+    const hh = h % 24;
+    if (d < 365) return `${d}天${p(hh)}时${p(mm)}分${p(s)}秒`;
+    const y = Math.floor(d / 365);
+    return `${y}年${p(d % 365)}天${p(hh)}时${p(mm)}分${p(s)}秒`;
   }
   function fmtLat(ms) {
     const s = Math.max(0, (ms || 0) / 1000);
