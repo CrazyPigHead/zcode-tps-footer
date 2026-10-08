@@ -4,7 +4,9 @@
  * 由 MCP 监督者（../mcp/supervisor.mjs）按需拉起，单例常驻：
  *   - 端口被占（bind 失败）即退出 = 并发拉起的输家静默退场；
  *   - 常驻不退出；/turns 闲置超 10 分钟挂起远端 SSH 轮询（省掉空转连接），
- *     任何请求即刻恢复；崩溃由监督者的看门狗重拉。
+ *     任何请求即刻恢复；崩溃由常驻监视器（monitor.mjs，监督者拉起、与 MCP 连接
+ *     生命周期解耦）捕获退出码与 stderr 尾部后秒级重拉——2026-10 实测服务会在
+ *     远端活跃期无声退出且不留任何痕迹（stdio 被父进程 ignore），必须先抓到现场。
  *
  * Remote SSH 模式下 ZCode 的 CLI 跑在远程机器上，用量写在远端 ~/.zcode/cli/db/db.sqlite，
  * 本地没有任何副本。因此本服务：
@@ -20,7 +22,10 @@
  * 端点（live 条目另带 phase/gen_start_ms/gap_start_ms/steps_settled 步内实时字段；
  * 全部条目带 query_source/ctx_tokens/ctx_window——子会话上下文水位三件套，见下方
  * 目录解析与 foldLocal 注释，inject.js 只对 subagent/workflow_child 追加「上下文 K (百分比)」）：
- *   GET /healthz          → "ok"
+ *   GET /healthz          → {"ok":true,"pid":pid,"idle_s":sec,"suspended":bool}
+ *                            （idle_s = 距最近一次 /turns 请求的秒数，仅该端点计入
+ *                             ——渲染层在世时 inject 每秒取数，idle_s 持续归零；长期
+ *                             无请求 = ZCode 已关闭，监视器据此做闲置退场）
  *   GET /turns?limit=800[&since=ms] → {"turns":[...],"since":ms,"full":bool,"tps":bool}
  *                            （本地+全部远端合并，按 end_ms 降序；带 since 走增量：
  *                             live 全带 + 水位-边距内已结算轮；tps = 注入开关，见 /tps-state）
@@ -106,6 +111,32 @@ function cleanupLog() {
   }
 }
 
+// ---------------------------------------------------------------- 进程死亡可观测
+//
+// 2026-10-08 排查：服务多次在远端活跃期退出且不留任何日志（父进程 stdio:ignore，
+// stderr 上的 V8 致命错误/未处理 rejection 全部进了黑洞，WER 也无记录）。以下三个
+// 钩子保证「死前最后一句话」落在 server.log；配合 monitor.mjs 捕获的退出码/stderr
+// 尾部，下次复发即可定位。uncaught/unhandledRejection 记录后不退出：单例数据服务
+// 全部状态可由下一个请求重建，带伤运行的代价远小于死掉等监督者（历史实测曾死透
+// 8 分钟~2 小时无人重拉）。
+
+function errBrief(e) {
+  if (!e) return String(e);
+  const stack = e.stack ? e.stack.split("\n").slice(0, 4).join(" | ") : "";
+  return `${e.message || e}${stack ? ` @ ${stack}` : ""}`;
+}
+
+process.on("uncaughtException", (e) => log(`[UNCAUGHT] ${errBrief(e)}`));
+process.on("unhandledRejection", (r) => log(`[UNHANDLED-REJECT] ${errBrief(r && r.stack ? r : String(r))}`));
+process.on("exit", (code) => {
+  // exit 回调里只允许同步操作；bind 竞争输家（[FATAL]→exit(1)）此前连一行痕迹都不留
+  try {
+    fs.appendFileSync(LOG_PATH, `${ts()} [EXIT] code=${code}\n`, "utf8");
+  } catch {
+    /* 日志失败不致命 */
+  }
+});
+
 // ---------------------------------------------------------------- 远端配置与状态
 
 // 远端来源：ZCode 桌面端设置（最近会话里的 SSH 目标，打开过新远端会自动出现）
@@ -120,6 +151,7 @@ function makeRemote(def) {
     map: new Map(), // turn_id(或 m:msg_id) -> turn 增量合并表；turns 是它的降序物化
     since: 0, // 增量水位（0 = 下次拉全量：首拉/失败后/周期自愈都会归零）
     lastFullAt: 0,
+    polled: false, // 本进程内是否已完成首次拉取尝试（成败均可）：全量响应的完整门控
     clockOffset: null, // 本地-远端时钟偏移最新采样（live 条目的 end_ms 即远端折叠时刻），
     //  供 live 冻结逐出换算时钟域用；map 里的 live 条目只能来自含 live 的响应，判定时必有采样
   };
@@ -347,9 +379,24 @@ function ctxTokensOfRow(r) {
   return r.comp_total || 0;
 }
 
+// 持久只读连接：WAL 模式下读者不阻塞写者，长连接语义等价；此前每次折叠都
+// open/close（活跃期每 0.5~2 秒一次），高频开关正在被 CLI 并发写的库是原生层
+// 最可疑的崩溃源（2026-10-08 多次无声退出均发生在 /turns 密集期，详见进程死亡
+// 可观测一节）。任何查询异常都弃置连接，下次折叠自动重开（库被替换/锁死等场景）。
+let localConn = null;
+function closeLocalConn() {
+  try {
+    if (localConn) localConn.close();
+  } catch {
+    /* close 失败不致命，连接对象一并丢弃 */
+  }
+  localConn = null;
+}
+
 function foldLocal() {
   const cut = Date.now() - 24 * 60 * 60 * 1000;
-  const conn = new DatabaseSync(DB, { readOnly: true });
+  if (!localConn) localConn = new DatabaseSync(DB, { readOnly: true });
+  const conn = localConn;
   try {
     // 单只读事务：四张表读到同一 WAL 快照，杜绝「marker 可见、tool 未可见」的撕裂帧
     conn.exec("BEGIN DEFERRED");
@@ -359,11 +406,13 @@ function foldLocal() {
       try {
         conn.exec("COMMIT");
       } catch {
-        /* 读事务异常时 close 即丢弃 */
+        /* 读事务异常时丢弃连接（下方 catch 兜底重开） */
+        closeLocalConn();
       }
     }
-  } finally {
-    conn.close();
+  } catch (e) {
+    closeLocalConn(); // 连接可能已处坏状态，绝不带着坏连接进下一次折叠
+    throw e;
   }
 }
 
@@ -783,6 +832,11 @@ async function fetchRemote(r) {
   // 失败一律清水位：下次成功走全量，增量状态机不背着脏水位继续跑
   const fail = (err) => {
     r.since = 0;
+    // polled 门控的语义是「本进程对这台远端的空表有代表性」。从未成功过（lastOk=0，
+    // 典型：服务重启恰逢断网/VPN 掉线）就置 polled=true，会把一张因故障而空的表
+    // 当成完整快照下发，注入端整体替换后远端轮次从界面集体消失——正是要修的 bug
+    // 换了个触发条件复发。只有成功过的远端失败才算「有代表性」（表里还留着旧数据）。
+    if (r.lastOk > 0) r.polled = true;
     return remoteFail(r, err);
   };
   if (res.code !== 0) return fail(`ssh rc=${res.code} ${res.stderr.slice(0, 200)}`);
@@ -822,10 +876,17 @@ async function fetchRemote(r) {
   r.lastOk = Date.now();
   r.consecFail = 0;
   r.lastErr = "";
+  r.polled = true;
   log(`[REMOTE-OK] ${r.name} turns=${r.turns.length} ${full ? "full" : `inc+${(data.turns || []).length}`}`);
 }
 
-let lastHttpRequest = 0;
+let lastHttpRequest = 0; // 最近一次 /turns 请求（仅此端点计入：inject 靠它每秒取数，是「渲染层在世」的判据；/status、/ping 等排障端点不续命，也不给 /healthz 续命——否则监视器探活会阻止闲置判定）
+
+function idleState() {
+  const anchor = lastHttpRequest || processStartMs;
+  const idleS = Math.max(0, Math.round((Date.now() - anchor) / 1000));
+  return { idle_s: idleS, suspended: idleS > SUSPEND_AFTER_S };
+}
 
 // 每台远端独立调度：500ms 一tick，到点的、不在飞的远端并行拉起，互不等待。
 // 单台失败只有它自己退避（指数、封顶 MAX_BACKOFF），健康远端保持正常节奏不被拖慢。
@@ -846,7 +907,11 @@ async function remotePollLoop() {
       for (const r of remotes) {
         if (suspended || r.inFlight || now < r.nextPollAt) continue;
         r.inFlight = true;
+        // .catch 兜底：fetchRemote 理论上不抛（sshRun 只 resolve、解析均有 try/catch），
+        // 但这里若真抛出会成为无人接住的 rejection——Node 默认直接退进程，正是历史上
+        // 「无声死亡」的头号嫌疑路径
         fetchRemote(r)
+          .catch((e) => log(`[REMOTE-THROW] ${r.name} ${errBrief(e)}`))
           .finally(() => {
             r.inFlight = false;
             // 分档：渲染层活跃且该远端有 live 轮 → 快；活跃但远端无 live → 中档
@@ -870,6 +935,10 @@ async function remotePollLoop() {
 // sinceQ > 0 时只返回 live 条目 + end_ms >= sinceQ - INC_MARGIN_MS 的已结算轮
 //（与远端侧同一边距语义）；响应的 since 水位取全量口径的最新 end_ms——live 条目的
 // end_ms 即合成时刻，天然领先任何已结算轮，用它做下次过滤的锚不会漏新结算。
+// full 标记额外要求各远端都完成过一次拉取尝试：服务刚重启的 1~2 秒里远端表还是
+// 空的，此刻把「全量」应答交给注入端会被其整体替换语义采纳，远端轮次从界面上
+// 集体消失（2026-10-08 实测 NOMATCH dom=11 cache=10 就是这个窗口）。置 false 后
+// 注入端退化为合并语义，旧缓存原样保留。
 function mergedTurns(limit, sinceQ = 0) {
   const out = [...getLocalTurns()];
   for (const r of remotes) {
@@ -887,7 +956,11 @@ function mergedTurns(limit, sinceQ = 0) {
   out.sort((a, b) => b.end_ms - a.end_ms);
   const watermark = out.length ? out[0].end_ms : 0;
   const list = sinceQ > 0 ? out.filter((t) => t.live || t.end_ms >= sinceQ - INC_MARGIN_MS) : out;
-  return { turns: list.slice(0, limit), since: watermark, full: sinceQ <= 0 };
+  // cfgSig !== null = 本进程至少成功解析过一次远端配置。启动瞬间恰好撞上桌面端
+  // 原子重写 setting.json（半写 JSON 解析失败、remotes 暂为空表）时，空表 every
+  // 恒真会把不含远端数据的应答标记成完整快照——加这道门让它按合并语义交付。
+  const full = sinceQ <= 0 && remotes.every((r) => r.polled) && cfgSig !== null;
+  return { turns: list.slice(0, limit), since: watermark, full };
 }
 
 function statusPayload() {
@@ -938,7 +1011,7 @@ try {
 const server = createServer((req, res) => {
   try {
     const u = new URL(req.url, "http://127.0.0.1");
-    if (u.pathname === "/healthz") return send(res, 200, "ok", "text/plain");
+    if (u.pathname === "/healthz") return send(res, 200, JSON.stringify({ ok: true, pid: process.pid, ...idleState() }));
     if (u.pathname === "/tps-state") {
       if (req.method === "POST") {
         const v = u.searchParams.get("enabled") !== "0";
@@ -981,6 +1054,9 @@ const server = createServer((req, res) => {
 
 cleanupLog();
 setInterval(cleanupLog, 24 * 3600 * 1000).unref();
+// listen 之前先把远端表建好：首个 /turns（全量）就能给出正确的 full 完整性标记，
+// 不依赖 remotePollLoop 的首个 500ms tick
+reloadConfigIfChanged();
 remotePollLoop();
 log(`[START] pid=${process.pid} node=${process.version} port=${PORT} db=${DB} remote_fold=${REMOTE_FOLD} root=${ROOT}`);
 server.on("error", (e) => {

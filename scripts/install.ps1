@@ -84,6 +84,26 @@ if ($LASTEXITCODE -ne 0) {
 
 # ---------------------------------------------------------------- 2.（重）启动数据服务
 Write-Step "（重）启动数据服务"
+# 先停常驻监视器（monitor.mjs）：它 healthz 失联会秒级重拉服务，不停它下面的
+# 清理就是猫鼠游戏。主路径按 3118 仲裁端口属主找（位置无关：仓库移动/改名后，
+# 运行中旧监视器的命令行还是老路径，按路径匹配会漏杀，旧监视器就会一直占着
+# 仲裁端口，新监视器全部起不来——与下方 3117 的端口属主清理同一个教训）。
+$monListeners = Get-NetTCPConnection -LocalPort 3118 -State Listen -ErrorAction SilentlyContinue
+foreach ($procId in @($monListeners | Select-Object -ExpandProperty OwningProcess -Unique)) {
+  if (-not $procId) { continue }
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue
+  if ($p -and $p.Name -like "node*" -and $p.CommandLine -like "*monitor.mjs*") {
+    Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    Write-Host "   已停止旧监视器进程 pid=$procId（3118 端口属主）"
+  } else {
+    Write-Host "⚠️ 3118 端口被非本工具进程占用（pid=$procId）；新监视器将以无仲裁降级模式运行。" -ForegroundColor Yellow
+  }
+}
+# 兜底：改过 TPS_MONITOR_PORT 的测试实例不占 3118，按本仓库精确路径补杀
+$monitorPath = Join-Path $RepoRoot "server\monitor.mjs"
+Get-CimInstance Win32_Process -Filter "Name LIKE 'node%'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($monitorPath, [StringComparison]::OrdinalIgnoreCase) -ge 0 } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Host "   已停止旧监视器进程 pid=$($_.ProcessId)（本仓库 monitor.mjs）" }
 # 清理旧服务按 3117 端口属主找：命令行通配 "*tps-footer*" 在仓库改名/移动后失灵
 #（旧路径不再含该字样，旧服务长期占港）。只动「node 且命令行含 server.mjs」的
 # 属主；端口被无关进程占用时不误杀、仅告警。
@@ -106,16 +126,18 @@ Get-CimInstance Win32_Process -Filter "Name LIKE 'node%'" -ErrorAction SilentlyC
   Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($serverPath, [StringComparison]::OrdinalIgnoreCase) -ge 0 } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Host "   已停止旧服务进程 pid=$($_.ProcessId)（本仓库 server.mjs）" }
 Start-Sleep -Milliseconds 500
-Start-Process -FilePath $node -ArgumentList ('"' + (Join-Path $RepoRoot "server\server.mjs") + '"') -WindowStyle Hidden -WorkingDirectory $RepoRoot
+# 启动常驻监视器而非服务本身：监视器拉起并拥有数据服务（崩溃捕获退出码/stderr 落
+# logs/monitor.log，healthz 失联秒级重拉），此后不再依赖 MCP 连接存活做守护
+Start-Process -FilePath $node -ArgumentList ('"' + (Join-Path $RepoRoot "server\monitor.mjs") + '"') -WindowStyle Hidden -WorkingDirectory $RepoRoot
 $healthy = $false
-foreach ($i in 1..10) {
+foreach ($i in 1..15) {
   Start-Sleep -Milliseconds 800
   try { $c = New-Object Net.Sockets.TcpClient; $c.Connect("127.0.0.1", 3117); $c.Close(); $healthy = $true; break } catch {}
 }
 if ($healthy) {
-  Write-Host "✅ 数据服务就绪（127.0.0.1:3117；此后崩溃由 MCP 监督者随会话自动重拉）" -ForegroundColor Green
+  Write-Host "✅ 数据服务就绪（127.0.0.1:3117；常驻监视器守护，崩溃秒级重拉、退出码与 stderr 记录在 logs\monitor.log）" -ForegroundColor Green
 } else {
-  Write-Host "⚠️ 服务未立即响应；重启 ZCode 后首个会话会经 MCP 自动拉起。日志：$RepoRoot\logs\server.log" -ForegroundColor Yellow
+  Write-Host "⚠️ 服务未立即响应；重启 ZCode 后首个会话会经 MCP 自动拉起。日志：$RepoRoot\logs\server.log 与 monitor.log" -ForegroundColor Yellow
 }
 
 # ---------------------------------------------------------------- 3. asar 注入

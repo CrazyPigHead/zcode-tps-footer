@@ -124,10 +124,18 @@
       const r = await fetch(`${API}/turns?limit=800${since > 0 ? `&since=${since}` : ""}&_=${Date.now()}`);
       const j = await r.json();
       if (Array.isArray(j.turns)) {
-        if (since === 0) {
+        // 整体替换仅在服务端确认完整（j.full：全量请求且各远端已完成首拉）时进行。
+        // 服务重启后的 1~2 秒空窗里远端表还是空的，若此时按全量语义整体替换，远端
+        // 轮次会从缓存里被清掉、统计行集体消失，只能等下一次全量（最长 5 分钟）回来
+        //——退化为合并语义则旧缓存原样保留，增量一到立即原地续上
+        if (since === 0 && j.full === true) {
           turns = j.turns;
           lastFullAt = Date.now();
         } else {
+          // 全量请求即使服务端没标 full（远端从未拉通/新旧版本混跑）也必须推进
+          // 节流锚点：否则 lastFullAt 恒 0，「超 5 分钟强制全量」每次都命中，
+          // 退化成每秒全量拉取，增量机制整体失效。数据仍走合并语义，旧缓存保留
+          if (since === 0) lastFullAt = Date.now();
           turns = mergeTurns(turns, j.turns);
         }
         since = typeof j.since === "number" && j.since > 0 ? j.since : 0;

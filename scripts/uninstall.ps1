@@ -13,7 +13,21 @@ $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $node = (Get-Command node -ErrorAction SilentlyContinue).Source
 
 # 1) 停止数据服务（按命令行匹配本项目的数据面进程；MCP 监督者随会话退出，无需处理）
+#    先停常驻监视器（monitor.mjs）：它发现 healthz 失联会把刚停掉的服务立刻拉回来。
+#    主路径按 3118 仲裁端口属主找（位置无关，仓库移动/改名后仍能命中），宽匹配兜底
 Write-Host "== 停止数据服务 ..."
+$monListeners = Get-NetTCPConnection -LocalPort 3118 -State Listen -ErrorAction SilentlyContinue
+foreach ($procId in @($monListeners | Select-Object -ExpandProperty OwningProcess -Unique)) {
+  if (-not $procId) { continue }
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue
+  if ($p -and $p.Name -like "node*" -and $p.CommandLine -like "*monitor.mjs*") {
+    Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    Write-Host "   已停止监视器进程 pid=$procId（3118 端口属主）"
+  }
+}
+Get-CimInstance Win32_Process -Filter "Name LIKE 'node%'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -like "*monitor.mjs*" -and $_.CommandLine -like "*tps-footer*" } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Host "   已停止监视器进程 pid=$($_.ProcessId)" }
 Get-CimInstance Win32_Process -Filter "Name LIKE 'node%'" -ErrorAction SilentlyContinue |
   Where-Object { $_.CommandLine -like "*server.mjs*" -and $_.CommandLine -like "*tps-footer*" } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Host "   已停止服务进程 pid=$($_.ProcessId)" }
