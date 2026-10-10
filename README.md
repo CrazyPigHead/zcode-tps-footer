@@ -2,6 +2,8 @@
 
 在 ZCode 桌面版（Z.ai 的桌面编码智能体）每条回答的下面显示一行用量统计，样式参考 DeepSeek Harness。本地会话和 Remote SSH 远程会话都能显示：
 
+![效果样例：主会话（左）与子智能体面板（右）每条回答底部的统计行](docs/images/example.png)
+
 ```
 15:40 · 第8轮·12步 · 用时 7分40秒 · 首 token 7秒 · 49 tok/s · GLM-5.3
 16:02 · 第3轮·6步 · 编辑 等待确认 8秒 · 用时 1分12秒 · 首 token 2.8秒 · 88 tok/s · GLM-5.3
@@ -17,6 +19,78 @@
 - **live**：进行中的轮次。它的数据每秒都在变，由本工具实时计算。
 
 > 衍生自 [HuaiPengFei666/zcode-tps-footer](https://github.com/HuaiPengFei666/zcode-tps-footer)（macOS 版，MIT）。本仓库面向 Windows，附一键安装/卸载脚本。仓库目录就是安装目录：MCP 注册和注入到 ZCode 界面的脚本都直接指向克隆下来的文件，装完后这个目录要一直保留。
+
+## 前置要求
+
+- Windows + ZCode 桌面版（官方安装包）
+- Node.js ≥ 23.4，`node` 在 PATH 上：MCP 监督者、数据服务、用 `npx asar` 解包/打包都要用它
+- 克隆下来的目录要一直保留：MCP 注册和 asar 注入都指向仓库内文件，移动或删除仓库等同于卸载（换了位置重跑一遍 `install.ps1` 就行）
+- 远端服务器（可选）：SSH 免密可登录（`ssh <user>@<host> echo ok` 不输密码就通），装有 python3（Linux 发行版标配）
+- 本地不需要 Python
+
+## 安装
+
+```powershell
+cd <仓库目录>
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+# 若 ZCode 正在运行：先完全退出再跑，或直接加 -KillZCode
+# 探测不到安装目录时：-ZCodeDir "D:\ProgramFiles\ZCode"
+# 完成后完全退出 ZCode 再打开
+```
+
+脚本依次做三件事：注册用户级 MCP server（配置键 `mcp.servers.zcode-tps-footer`，只增删本项目的条目，其他设置原样保留）、启动数据服务、向 app.asar 注入脚本标签。
+
+装完必须完全退出并重启 ZCode：注入到界面的脚本行要重启才会加载，MCP 注册也要等新会话建立连接才生效。
+
+运行时产生的文件只有日志与开关状态，在仓库 `logs/` 目录（已 gitignore）：
+
+```
+<仓库目录>\logs\
+  ├── server.log      数据服务日志（含 [UNCAUGHT]/[UNHANDLED-REJECT]/[EXIT] 进程死亡痕迹）
+  ├── monitor.log     常驻监视器日志（服务崩溃的退出码、信号、运行时长与 stderr 尾部）
+  ├── tps-state.json  统计行开关状态（/tps-state 写入，见下）
+  └── supervisor.log  MCP 监督者日志
+```
+
+### 排障：统计行 A/B 开关
+
+排查界面问题（如闪烁、卡顿）时，可以不重启 ZCode，直接把全部统计行临时撤掉/恢复，做对比测试：
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:3117/tps-state?enabled=0"   # 撤掉全部统计行（≤2s 生效）
+curl.exe -X POST "http://127.0.0.1:3117/tps-state?enabled=1"   # 恢复
+curl.exe "http://127.0.0.1:3117/tps-state"                     # 查询当前状态
+```
+
+撤掉后问题仍在，说明与注入无关（是应用原生行为）；撤掉后问题消失，说明是注入侧的问题。开关状态随 `/turns` 响应下发给界面脚本，并持久化在 `logs/tps-state.json`，服务重启后保持。2026-09 排查「侧边栏闪烁」用的就是这个方法：撤掉注入后依然闪烁，确认是 ZCode 原生渲染行为（滚动渐隐 mask 导致整层重绘、虚拟列表先按估算高度排版再跳变为实测值等，见 `ConversationTimeline.tsx`），与注入无关。
+
+### 远端主机：零配置，自动识别
+
+远端列表从 ZCode 桌面端设置（`~/.zcode/v2/setting.json` 的最近 SSH 会话列表）自动解析：在桌面端打开过一台新远端，它的用量就会自动进统计行，不需要任何配置。两点注意：
+
+- 最近会话列表有淘汰机制。老远端被新会话挤出列表后就不再被轮询；常用的远端偶尔在桌面端打开一次，就能保持在列表里。
+- 连不上的远端不会拖累其他远端。各远端独立并行轮询，单台失败只对它自己退避，`/status` 里能看到各远端的 `error` 详情。
+
+## 卸载
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\uninstall.ps1
+# 移除 MCP 注册 + 按版本恢复原始 app.asar + 停止数据服务（仓库内的配置与日志保留）
+```
+
+以后不用了，直接删掉整个仓库也行。
+
+## ZCode 更新后
+
+整包更新会覆盖 app.asar，统计行会消失，但不影响 ZCode 本身使用，重跑一遍 `install.ps1` 就能恢复（脚本自动检测并重新注入，MCP 注册不受影响）。重跑时，官方原包的备份 `resources\app.asar.tps-bak.v<版本>` 会同步更新为新版，旧版本的备份自动删除；之后再卸载，恢复的就是新版原包，不会把 ZCode 回退到旧版本。
+
+## 日常改动与生效方式
+
+| 改动 | 生效方式 |
+| --- | --- |
+| ZCode 桌面端打开过新远端 | 自动出现在统计行（解析 `~/.zcode/v2/setting.json`），什么都不用做 |
+| 仓库里的 `server.mjs` / `supervisor.mjs` / `remote_fold.py` | 重跑 `install.ps1`（会顺带重启数据服务以加载新代码；ZCode 正在运行时脚本会在 asar 注入这一步安全停下，先完全退出 ZCode 或加 `-KillZCode` 再跑） |
+| 仓库里的 `inject/inject.js`（样式/字段） | 只需完全退出 ZCode 重开，不涉及服务与 asar |
 
 ## 特性
 
@@ -114,57 +188,6 @@ inject/inject.js（界面注入脚本）─┘
 
 **live 条目超时未刷新的检测与移除**：live 条目的 `end_ms` 每次回传都会刷新为远端汇总的时刻，轮询正常时秒级刷新（轮询失败时不参与移除判定，故障期间旧数据原样保留）。超过 5 分钟（`LIVE_FREEZE_MS`）没有刷新，说明远端已不再产生这个条目，就及时把它移除——避免已经中断的「运行中」条目一直计时，直到定期全量刷新才消失。判定时会按每台远端采样到的本地-远端时钟偏移，把时间换算到同一时钟域再比较（凡是带 live 条目的响应都顺便提供一次采样），所以远端时钟偏快或偏慢都不影响正确性。
 
-## 前置要求
-
-- Windows + ZCode 桌面版（官方安装包）
-- Node.js ≥ 23.4，`node` 在 PATH 上：MCP 监督者、数据服务、用 `npx asar` 解包/打包都要用它
-- 克隆下来的目录要一直保留：MCP 注册和 asar 注入都指向仓库内文件，移动或删除仓库等同于卸载（换了位置重跑一遍 `install.ps1` 就行）
-- 远端服务器（可选）：SSH 免密可登录（`ssh <user>@<host> echo ok` 不输密码就通），装有 python3（Linux 发行版标配）
-- 本地不需要 Python
-
-## 安装
-
-```powershell
-cd <仓库目录>
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1
-# 若 ZCode 正在运行：先完全退出再跑，或直接加 -KillZCode
-# 探测不到安装目录时：-ZCodeDir "D:\ProgramFiles\ZCode"
-# 完成后完全退出 ZCode 再打开
-```
-
-脚本依次做三件事：注册用户级 MCP server（配置键 `mcp.servers.zcode-tps-footer`，只增删本项目的条目，其他设置原样保留）、启动数据服务、向 app.asar 注入脚本标签。
-
-装完必须完全退出并重启 ZCode：注入到界面的脚本行要重启才会加载，MCP 注册也要等新会话建立连接才生效。
-
-运行时产生的文件只有日志与开关状态，在仓库 `logs/` 目录（已 gitignore）：
-
-```
-<仓库目录>\logs\
-  ├── server.log      数据服务日志（含 [UNCAUGHT]/[UNHANDLED-REJECT]/[EXIT] 进程死亡痕迹）
-  ├── monitor.log     常驻监视器日志（服务崩溃的退出码、信号、运行时长与 stderr 尾部）
-  ├── tps-state.json  统计行开关状态（/tps-state 写入，见下）
-  └── supervisor.log  MCP 监督者日志
-```
-
-### 排障：统计行 A/B 开关
-
-排查界面问题（如闪烁、卡顿）时，可以不重启 ZCode，直接把全部统计行临时撤掉/恢复，做对比测试：
-
-```powershell
-curl.exe -X POST "http://127.0.0.1:3117/tps-state?enabled=0"   # 撤掉全部统计行（≤2s 生效）
-curl.exe -X POST "http://127.0.0.1:3117/tps-state?enabled=1"   # 恢复
-curl.exe "http://127.0.0.1:3117/tps-state"                     # 查询当前状态
-```
-
-撤掉后问题仍在，说明与注入无关（是应用原生行为）；撤掉后问题消失，说明是注入侧的问题。开关状态随 `/turns` 响应下发给界面脚本，并持久化在 `logs/tps-state.json`，服务重启后保持。2026-09 排查「侧边栏闪烁」用的就是这个方法：撤掉注入后依然闪烁，确认是 ZCode 原生渲染行为（滚动渐隐 mask 导致整层重绘、虚拟列表先按估算高度排版再跳变为实测值等，见 `ConversationTimeline.tsx`），与注入无关。
-
-### 远端主机：零配置，自动识别
-
-远端列表从 ZCode 桌面端设置（`~/.zcode/v2/setting.json` 的最近 SSH 会话列表）自动解析：在桌面端打开过一台新远端，它的用量就会自动进统计行，不需要任何配置。两点注意：
-
-- 最近会话列表有淘汰机制。老远端被新会话挤出列表后就不再被轮询；常用的远端偶尔在桌面端打开一次，就能保持在列表里。
-- 连不上的远端不会拖累其他远端。各远端独立并行轮询，单台失败只对它自己退避，`/status` 里能看到各远端的 `error` 详情。
-
 ## 数据服务生命周期
 
 | 事件 | 行为 |
@@ -175,27 +198,6 @@ curl.exe "http://127.0.0.1:3117/tps-state"                     # 查询当前状
 | ZCode 关闭约 20 分钟（闲置连续确认） | 监视器回收服务并自行退出，后台完全退干净（`logs/monitor.log` 留 `[IDLE-EXIT]` 记录）；仍在存活的闲置 CLI 会话的看门狗有冷却窗（`logs/monitor.state`，2× 阈值时长），不会把刚退场的后台拉锯式反复拉起 |
 | 再次打开 ZCode | 首个会话的监督者发现服务/监视器不在岗，自动补拉，守护链原样恢复；`/turns` 请求本身也会立即恢复轮询 |
 | 多个会话同时冷启动 | 监视器按仲裁端口去重、服务按数据端口 bind 竞争去重，各实例输家静默退场，保证单例 |
-
-## 日常改动与生效方式
-
-| 改动 | 生效方式 |
-| --- | --- |
-| ZCode 桌面端打开过新远端 | 自动出现在统计行（解析 `~/.zcode/v2/setting.json`），什么都不用做 |
-| 仓库里的 `server.mjs` / `supervisor.mjs` / `remote_fold.py` | 重跑 `install.ps1`（会顺带重启数据服务以加载新代码；ZCode 正在运行时脚本会在 asar 注入这一步安全停下，先完全退出 ZCode 或加 `-KillZCode` 再跑） |
-| 仓库里的 `inject/inject.js`（样式/字段） | 只需完全退出 ZCode 重开，不涉及服务与 asar |
-
-## 卸载
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\uninstall.ps1
-# 移除 MCP 注册 + 按版本恢复原始 app.asar + 停止数据服务（仓库内的配置与日志保留）
-```
-
-以后不用了，直接删掉整个仓库也行。
-
-## ZCode 更新后
-
-整包更新会覆盖 app.asar，统计行会消失，但不影响 ZCode 本身使用，重跑一遍 `install.ps1` 就能恢复（脚本自动检测并重新注入，MCP 注册不受影响）。重跑时，官方原包的备份 `resources\app.asar.tps-bak.v<版本>` 会同步更新为新版，旧版本的备份自动删除；之后再卸载，恢复的就是新版原包，不会把 ZCode 回退到旧版本。
 
 ## 常见问题
 
