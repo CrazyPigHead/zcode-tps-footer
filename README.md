@@ -94,7 +94,7 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall.ps1
 
 ## 特性
 
-- 安装脚本把一个 MCP server 注册进用户级配置 `~/.zcode/cli/config.json` 的 `mcp.servers`。这个 MCP server 不提供任何工具，唯一作用是充当启动入口：ZCode 每个会话建立 MCP 连接时都会顺带检查数据服务是否在运行，没在运行就自动把它启动。数据服务由一只**常驻监视器**（`server/monitor.mjs`）守护：监视器与服务拥有共同的生死档案（崩溃退出码与 stderr 尾部记在 `logs/monitor.log`），healthz 失联秒级重拉；监视器与 MCP 连接生命周期解耦，纯远程工作的时段（本地没有任何活跃 MCP 连接）服务死了也有人管。服务内部把未捕获异常、未处理 rejection、进程退出码全部落 `logs/server.log`，不再有「无声死亡」。长时间无人使用时暂停远端轮询；ZCode 关闭约 20 分钟后，监视器回收服务并自行退出——后台完全退干净，下次打开 ZCode 时监督者自动把整套守护链拉起来。
+- 安装脚本把一个 MCP server 注册进用户级配置 `~/.zcode/cli/config.json` 的 `mcp.servers`。这个 MCP server 不提供任何工具，唯一作用是充当启动入口：ZCode 每个会话建立 MCP 连接时都会顺带检查数据服务是否在运行，没在运行就自动把它启动。数据服务由一只**常驻监视器**（`server/monitor.mjs`）守护：监视器与服务拥有共同的生死档案（崩溃退出码与 stderr 尾部记在 `logs/monitor.log`），healthz 失联秒级重拉；监视器与 MCP 连接生命周期解耦，纯远程工作的时段（本地没有任何活跃 MCP 连接）服务死了也有人管——前提是监视器由用户直启或安装脚本拉起（supervisor 拉起的监视器会随 ZCode 回收 MCP 连接被连坐，见「[SSH-only 使用](#ssh-only-使用守护链被-zcode-连坐回收原理与用户直启)」一节）。服务内部把未捕获异常、未处理 rejection、进程退出码全部落 `logs/server.log`，不再有「无声死亡」。长时间无人使用时暂停远端轮询；ZCode 关闭约 20 分钟后（闲置期间本机探测不到ZCode 进程时才动手），监视器回收服务并自行退出——后台完全退干净，下次打开 ZCode 时监督者自动把整套守护链拉起来。
 - 没有部署副本，也没有配置文件。ZCode 界面直接加载仓库里的 `inject/inject.js`，日志写在仓库 `logs/` 目录。远端主机列表从 ZCode 桌面端的设置里自动解析：在桌面端打开过哪台远端，哪台的用量就会出现在统计行里。
 - 本地不用装 Python。数据服务用 Node.js 重写，通过 `node:sqlite` 只读访问本地用量数据库；Python 只在远端服务器上执行（Linux 远端一般自带 python3）。
 - Remote SSH 会话的数据在远端完成汇总，远端用量数据库（可能有几百 MB）不会被整个拉回来：一个小脚本被推到远端，在那里把用量算好，只回传结果。脚本按内容 hash 缓存在远端 `~/.cache/zcode-tps-footer/`（先写临时文件再改名，避免读到写了一半的文件；升级后脚本内容变了，缓存文件名随之变化、自动重新上传；7 天以上的旧缓存按修改时间自动清理；目录不可写时改为每次通过 stdin 直接把脚本内容传过去）。正常运行时每轮只发一条执行命令，已结算轮还支持增量回传（见下文「since 增量协议」），每轮往返只有几百字节；本地按 turn_id（全局唯一的 UUID）把远端数据与本地数据合并。
@@ -195,13 +195,41 @@ inject/inject.js（界面注入脚本）─┘
 | ZCode 会话建立 MCP 连接（启动、新建或恢复会话） | 监督者检查服务与监视器是否在岗，不在就启动常驻监视器（监视器冷启动时服务若已在则只守护不重拉），服务没在跑由监视器拉起 |
 | 服务崩溃 | 监视器捕获退出码与 stderr 落 `logs/monitor.log`，healthz 失联秒级重拉（不再依赖 MCP 连接存活） |
 | ZCode 全部关闭 | 服务留在后台但进入闲置：10 分钟后暂停远端 SSH 轮询（不保持任何连接），本地零 CPU；监视器继续低频看护 |
-| ZCode 关闭约 20 分钟（闲置连续确认） | 监视器回收服务并自行退出，后台完全退干净（`logs/monitor.log` 留 `[IDLE-EXIT]` 记录）；仍在存活的闲置 CLI 会话的看门狗有冷却窗（`logs/monitor.state`，2× 阈值时长），不会把刚退场的后台拉锯式反复拉起 |
+| ZCode 关闭约 20 分钟（闲置连续确认 + ZCode 进程硬门） | 监视器回收服务并自行退出，后台完全退干净（`logs/monitor.log` 留 `[IDLE-EXIT]` 记录）；动手前会从本机进程表确认 ZCode 不在运行（win32 查 `zcode.exe`，Linux/macOS 查 `zcode`；名单可用 `TPS_ZCODE_PROCS` 覆盖）——idle 判据区分不了「ZCode 已关」和「ZCode 开着但窗口后台/系统睡眠导致取数被节流」，硬门堵的就是后者（拦下时留 `[IDLE-GATE]` 记录）。仍在存活的闲置 CLI 会话的看门狗有冷却窗（`logs/monitor.state`，2× 阈值时长），不会把刚退场的后台拉锯式反复拉起 |
 | 再次打开 ZCode | 首个会话的监督者发现服务/监视器不在岗，自动补拉，守护链原样恢复；`/turns` 请求本身也会立即恢复轮询 |
+| 本地会话结束/闲置回收（典型：切到纯 SSH 工作时段） | 约 30 秒后 ZCode 终止 MCP 进程树（Windows Job Object 连坐，硬终止不留日志）：supervisor、监视器、服务全族同死；SSH 会话的 MCP 在远端、本地无人复活——统计行缺失直到下次本地会话连接或用户直启（见下节） |
 | 多个会话同时冷启动 | 监视器按仲裁端口去重、服务按数据端口 bind 竞争去重，各实例输家静默退场，保证单例 |
+
+## SSH-only 使用：守护链被 ZCode 连坐回收（原理与用户直启）
+
+**原理**——ZCode 桌面端对 stdio MCP server 有一套刻意的进程树回收机制（以下行为均可在 ZCode 源码 `apps/zcode-cli/packages/adapters/src/mcp/` 对照）：
+
+1. **每个 stdio MCP server 进程一个「关闭即杀」的 Job Object**：server 启动即被挂进一个设置了 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Windows job（`windows-job-object.ts`）。job 成员身份随子进程自动继承，且 job 未开放 breakaway——Node 的 `detached: true` 只创建新进程组，**不脱离 job**，所以 supervisor detached 拉起的监视器、监视器拥有的数据服务全在 job 里。
+2. **连接关闭 = 全族处决**：MCP 连接关闭时（`stdio-transport.ts` 对 `_dispose` 的覆写）先 `TerminateJobObject` 再 `taskkill /PID <pid> /T /F` 双保险。进程死于硬终止，一行日志遗言都不会留——`monitor.log`/`server.log` 里那些凭空断流的「无声死亡」就是它。ZCode 注释明确这是有意设计（防 MCP server 的 watchdog 类后代残留）。
+3. **触发时机**：会话结束/切换后连接池有 **30 秒**闲置宽限（`pool.ts`）；mcp-status 控制面泳道闲置 **5 分钟**整树回收；关闭 workspace、应用退出同理。
+4. **SSH 会话救不了本地**：Remote SSH 会话的 MCP server 由**远端** zcode-server 进程 spawn，本地不产生任何 MCP 连接——SSH-only 时段本地既无 supervisor 也无看门狗，链被连坐后无人复活。这就是「SSH 用一阵统计行消失、开个本地会话就恢复；本地会话一关，半小时内又没了」的完整机制：本地会话建立 MCP 连接 → supervisor 的 `ensureService` 把链拉起（但拉起的链在 job 里）→ 本地会话关闭约 30 秒后链又被连坐。
+
+闲置退场的 ZCode 进程硬门（见上表）只防「监视器自己误判退场」这一条路径，防不了这种外部连坐。
+
+**对策：`scripts\start-service.ps1`（用户直启，链在 ZCode 进程树之外）**
+
+由你本人启动的进程不在任何 ZCode 的 job / 进程树里，`TerminateJobObject` 与 `taskkill /T` 都够不着，链可以一直活到关机或手动停止：
+
+```powershell
+# 独立终端（PowerShell / Windows Terminal / cmd 均可），不要在 ZCode 会话内执行
+powershell -ExecutionPolicy Bypass -File <仓库目录>\scripts\start-service.ps1
+```
+
+- 服务已在岗：直接退出，不重启不扰动；否则清理本仓库残留（先监视器后服务）后 detached 拉起监视器，等 3117 就绪后报告。
+- 在 ZCode 进程树内执行会被脚本检测并**拒绝**（在这里拉起的链照样陪葬）；`-Force` 可跳过检测（不建议）。
+- 时机：开机后、开始一段 SSH-only 工作前、或统计行消失后，跑一次即可，可重复执行。
+- 停止这条链：`tools\regress\killnode.ps1`。
+
 
 ## 常见问题
 
 - **统计行没出现**：先确认完全重启过 ZCode，界面注入和 MCP 注册都要重启或新会话才生效。再看服务在不在跑：`curl --noproxy "*" http://127.0.0.1:3117/healthz`（本机有代理时必须带 `--noproxy "*"`，否则探测结果会被代理干扰）。`/status` 可以看各数据源的健康状况（`ok_age_s` / `consec_fail` / `error`）。日志在仓库 `logs/` 目录下（`supervisor.log`、`server.log`、`monitor.log`），MCP 注册项在 `~/.zcode/cli/config.json` 的 `mcp.servers`。
+- **SSH 会话用一阵统计行没了，开个本地会话就恢复**：ZCode 回收本地 MCP 连接时会把 supervisor 及其 detached 后代（监视器/数据服务）连坐硬杀（Job Object 机制，约在本地会话关闭 30 秒后），SSH-only 时段无人复活——不是本仓库的 bug。对策：在独立终端跑一次 `scripts\start-service.ps1`，由你本人拉起的链在 ZCode 进程树外、不会被连坐。详见「SSH-only 使用」一节。
 - **怀疑服务又崩了/反复重启**：看 `logs/monitor.log` 的 `[SERVICE-EXIT]` 行——退出码、信号、运行时长和崩溃时的 stderr 尾部都在（`code=4294967295` 是被外部强杀，`code=1` + [FATAL] 是端口竞争输家，有 stderr 尾部的是原生/V8 致命错误）；`logs/server.log` 里另有 `[UNCAUGHT]` / `[UNHANDLED-REJECT]` / `[EXIT]` 三类进程死亡痕迹。2026-10-08 之前的服务没有这些埋点，「无声死亡」查不到任何现场。
 - **远端会话没有统计行、本地有**：先确认该远端出现在 `/status` 的 remotes 里，没有就说明桌面端还没打开过它，用桌面端连一次即可被识别。再看该远端的 `error`：`ssh rc=...` 多半是需要密码或 known_hosts 变更，`remote: ...` 是远端侧读库问题。可以手动验证免密登录是否正常：`ssh <user>@<host> "python3 -c 1"`。
 - **首次安装后第一个会话没有启动服务**：个别情况下，首次安装后的第一个 MCP 连接是「幻影连接」——ZCode 的信任确认流程还没走完，连接并不会真正启动进程；信任确认之后的下一个会话会自动恢复正常。手动解决办法就是重跑 `install.ps1`。
