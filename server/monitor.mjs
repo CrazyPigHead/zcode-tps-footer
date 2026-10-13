@@ -17,7 +17,10 @@
  *     自己拉起的子进程活着但 20 秒后仍不服务（事件循环挂死）则先杀再拉；
  *   - 闲置退场：healthz 应答里的 idle_s 反映「数据面多久没人用了」。渲染层在世
  *     时 inject 每秒取数，idle_s 持续归零；ZCode 关闭后 /turns 断流，idle_s 走高
- *     （远端轮询 10 分钟起完全挂起，服务零流量）。连续 IDLE_CONFIRM_ROUNDS 轮
+ *     （远端轮询 10 分钟起完全挂起，服务零流量）。但 idle_s 区分不了「ZCode 已
+ *     关闭」和「ZCode 开着但渲染层被节流」（窗口后台/系统睡眠时 Chromium 会把
+ *     每秒取数压到分钟级甚至暂停），所以确认退场前还有道进程硬门：本机探测到
+ *     ZCode 进程在运行（见「ZCode 进程硬门」）就不退。连续 IDLE_CONFIRM_ROUNDS 轮
  *     （间隔 CHECK_S，要求跨越服务自身 SUSPEND_AFTER_S=600s 的挂起点且再留
  *     IDLE_EXTRA_S 观察期，防挂起瞬间的抖动误判）都确认闲置 → 杀掉服务、退出
  *     自己——「ZCode 关闭一段时间后所有后台进程退干净」。下次任何 ZCode 会话
@@ -33,6 +36,10 @@
  *   TPS_FOOTER_PORT   数据服务端口（默认 3117）
  *   TPS_MONITOR_PORT  监视器仲裁端口（默认数据端口+1）
  *   TPS_IDLE_EXIT_S   闲置退场阈值秒数（默认 1200；测试可调小加速验证）
+ *   TPS_ZCODE_PROCS  闲置退场硬门的 ZCode 进程名名单（逗号分隔；win32 默认
+ *                     zcode.exe，其余平台 zcode；按进程 basename 不区分大小写
+ *                     精确比对。测试注入 stub 名用——避开真机在跑的真 ZCode）
+ *   TPS_ZCODE_GATE_S 硬门拦下退场后的重探间隔秒数（默认 60；测试可调小加速）
  * 运行时文件：logs/monitor.log（SPAWN/EXIT/crash 现场，14 天由数据面日志清理顺带不管，
  * 本文件量极小，按 512KB 截顶防无界增长）；logs/monitor.state（闲置退场时间戳标记，
  * 监督者看门狗的冷却依据——防「闲置 CLI 会话不取数」场景下看门狗把刚退场的后台
@@ -64,6 +71,13 @@ const MAX_BACKOFF_S = 60;
 // 闲置退场（常驻语义，与旧版行为一致）。
 const IDLE_EXIT_S = process.env.TPS_IDLE_EXIT_S !== undefined ? Number(process.env.TPS_IDLE_EXIT_S) : 1200;
 const IDLE_CONFIRM_ROUNDS = 2;
+// ZCode 进程硬门的名单与节流（实现见 zcodeRunning 一节）：win32 tasklist 上报带 .exe
+// 后缀、*nix ps comm 无后缀，两端默认值不同；按 basename 精确比对避免子串误命中。
+const ZCODE_PROCS = (process.env.TPS_ZCODE_PROCS !== undefined
+  ? process.env.TPS_ZCODE_PROCS
+  : process.platform === "win32" ? "zcode.exe" : "zcode"
+).split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const GATE_CHECK_S = Number(process.env.TPS_ZCODE_GATE_S) || 60;
 
 function ts() {
   const d = new Date();
@@ -128,6 +142,56 @@ async function probe(timeoutMs = 3000) {
 
 function healthz(timeoutMs = 3000) {
   return probe(timeoutMs).then((r) => r.up);
+}
+
+// ---------------------------------------------------------------- ZCode 进程硬门
+//
+// idle_s 区分不了「ZCode 已关闭」和「ZCode 开着但渲染层被节流」（窗口后台/系统
+// 睡眠时 Chromium 把每秒取数压停，/turns 断流）——闲置退场动手前必须亲眼从进程
+// 表确认 ZCode 不在运行。只在闲置确认达标后才会被咨询（至多每 CHECK_S 一次）；
+// 阳性结果 GATE_CHECK_S 内走缓存（硬门持续拦退场时 tasklist/ps 频率压到 1 次/分），
+// 阴性不缓存（结果随即被动手消费，缓存无意义）。探测失败按「不在运行」解析：
+// fail-open——硬门失灵最多退化回无门的旧行为（误退场），绝不把服务焊死成永不
+// 退场。按进程 basename 不区分大小写精确比对，不做子串匹配。
+let zcodeProbeAt = 0;
+let zcodeProbeHit = false;
+let gateLogAt = 0;
+function listProcesses() {
+  return new Promise((resolve) => {
+    // win32：tasklist CSV 首列是映像名（带 .exe）；*nix：ps comm= 每行一个可执行
+    // 名（macOS 是完整路径，linux 可能截到 15 字符——名单是短名，不受影响）。
+    // 只用各平台自带工具，零第三方依赖。
+    const cmd = process.platform === "win32"
+      ? spawn("tasklist", ["/FO", "CSV", "/NH"], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true })
+      : spawn("ps", ["-eo", "comm="], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    cmd.stdout.setEncoding("utf8");
+    cmd.stdout.on("data", (c) => (out += c));
+    cmd.on("error", () => resolve(null));
+    cmd.on("close", () => resolve(out));
+  });
+}
+async function zcodeRunning() {
+  if (zcodeProbeHit && Date.now() - zcodeProbeAt < GATE_CHECK_S * 1000) return true;
+  const out = await listProcesses();
+  if (out === null) return false;
+  zcodeProbeAt = Date.now();
+  zcodeProbeHit = false;
+  for (const line of out.split("\n")) {
+    let name = line.trim();
+    if (!name) continue;
+    if (process.platform === "win32") {
+      const m = name.match(/^"([^"]+)"/); // CSV 首列："ZCode.exe","6056",...
+      if (!m) continue;
+      name = m[1];
+    }
+    const base = name.replace(/\\/g, "/").split("/").pop().toLowerCase();
+    if (ZCODE_PROCS.includes(base)) {
+      zcodeProbeHit = true;
+      return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------- 服务子进程
@@ -264,29 +328,42 @@ async function mainLoop() {
         if (IDLE_EXIT_S > 0 && st.idleS >= IDLE_EXIT_S) {
           idleRounds += 1;
           if (idleRounds >= IDLE_CONFIRM_ROUNDS) {
-            log(`[IDLE-EXIT] 数据面闲置 ${st.idleS}s（阈值 ${IDLE_EXIT_S}s，连续 ${idleRounds} 轮确认），回收服务并退出——下次 ZCode 会话连接时由监督者重新拉起`);
-            // 退场标记：存活的监督者看门狗读到它就不在冷却窗口内补拉（否则「闲置 CLI
-            // 会话不取数」场景会拉锯：看门狗 2 分钟拉起 → 20 分钟又退场，无限循环）
-            try {
-              fs.writeFileSync(STATE_PATH, JSON.stringify({ last_idle_exit: Date.now(), idle_exit_s: IDLE_EXIT_S }), "utf8");
-            } catch {
-              /* 写不进标记只是退回到无冷却语义 */
-            }
-            if (child) await killChild();
-            // 服务不是自己的子进程（外部拉的）：按端口属主兜底回收，与退场语义
-            // 配套——「退干净」不能只退自己人。拿不到属主也不阻塞退出（此时服务
-            // 大概率已死）
-            if (await healthz()) await killPortOwner();
-            // 退出竞态兜底：确认到动手之间有数秒窗口，若用户恰好此时重开 ZCode
-            //（新请求把 idle_s 打回去/服务已被外部重新拉起），中止退场回到守护，
-            // 避免刚要被使用的服务被杀出 ~2 分钟统计行空窗
-            const fin = await probe();
-            if (fin.up && fin.idleS < IDLE_EXIT_S) {
-              log(`[IDLE-ABORT] 退场窗口内收到新请求（idle_s=${fin.idleS}），中止退场继续守护`);
-              if (!child && !(await healthz())) spawnService();
+            // ZCode 进程硬门：idle_s 达标只说明「没人取数」，不说明「ZCode 已关」——
+            // 渲染层被节流（窗口后台/系统睡眠）时 /turns 同样断流。本机进程表里还有
+            // ZCode（名单见 ZCODE_PROCS）就不退，把闲置确认打回去重数（ZCode 退出
+            // 后至多再等 IDLE_CONFIRM_ROUNDS 轮即正常退场）。
+            if (await zcodeRunning()) {
+              if (Date.now() - gateLogAt > GATE_CHECK_S * 1000) {
+                gateLogAt = Date.now();
+                log(`[IDLE-GATE] 数据面闲置 ${st.idleS}s 但 ZCode 进程（${ZCODE_PROCS.join(",")}）在运行，跳过闲置退场`);
+              }
               idleRounds = 0;
             } else {
-              process.exit(0);
+              log(`[IDLE-EXIT] 数据面闲置 ${st.idleS}s（阈值 ${IDLE_EXIT_S}s，连续 ${idleRounds} 轮确认），回收服务并退出——下次 ZCode 会话连接时由监督者重新拉起`);
+              // 退场标记：存活的监督者看门狗读到它就不在冷却窗口内补拉（否则「闲置
+              // CLI 会话不取数」场景会拉锯：看门狗 2 分钟拉起 → 20 分钟又退场，无限
+              // 循环）
+              try {
+                fs.writeFileSync(STATE_PATH, JSON.stringify({ last_idle_exit: Date.now(), idle_exit_s: IDLE_EXIT_S }), "utf8");
+              } catch {
+                /* 写不进标记只是退回到无冷却语义 */
+              }
+              if (child) await killChild();
+              // 服务不是自己的子进程（外部拉的）：按端口属主兜底回收，与退场语义
+              // 配套——「退干净」不能只退自己人。拿不到属主也不阻塞退出（此时服务
+              // 大概率已死）
+              if (await healthz()) await killPortOwner();
+              // 退出竞态兜底：确认到动手之间有数秒窗口，若用户恰好此时重开 ZCode
+              //（新请求把 idle_s 打回去/服务已被外部重新拉起），中止退场回到守护，
+              // 避免刚要被使用的服务被杀出 ~2 分钟统计行空窗
+              const fin = await probe();
+              if (fin.up && fin.idleS < IDLE_EXIT_S) {
+                log(`[IDLE-ABORT] 退场窗口内收到新请求（idle_s=${fin.idleS}），中止退场继续守护`);
+                if (!child && !(await healthz())) spawnService();
+                idleRounds = 0;
+              } else {
+                process.exit(0);
+              }
             }
           }
         } else {
@@ -354,6 +431,6 @@ arbiter.on("error", async (e) => {
   mainLoop();
 });
 arbiter.listen(MPORT, "127.0.0.1", () => {
-  log(`[START] monitor pid=${process.pid} node=${process.version} service=${SERVER} port=${PORT} arbiter=${MPORT} idle_exit=${IDLE_EXIT_S}s×${IDLE_CONFIRM_ROUNDS}`);
+  log(`[START] monitor pid=${process.pid} node=${process.version} service=${SERVER} port=${PORT} arbiter=${MPORT} idle_exit=${IDLE_EXIT_S}s×${IDLE_CONFIRM_ROUNDS}${IDLE_EXIT_S > 0 ? ` gate=${ZCODE_PROCS.join("/")}` : ""}`);
   mainLoop();
 });
