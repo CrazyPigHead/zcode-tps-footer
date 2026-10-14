@@ -130,8 +130,8 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall.ps1
 **上下文占用（仅子会话条目显示，如 `上下文 126K (63%)`）**：
 
 - 分子（当前占用的 token 数）= 该轮最后一条已结算 `model_usage` 行的 `input_tokens + output_tokens`，与官方 `getModelUsageContextTokens` 的算法一致。注意 AI SDK v6 的 `input_tokens` 已经包含 cache 读写部分，`cache_read_tokens` / `cache_write_tokens` 两列只是细分数据，不能再加一遍。它和官方输入框旁的容量表一样，反映「最后一步完成时」的占用，因此上下文压缩后的下一步会自然回落。
-- 分母（模型上下文窗口大小）不在用量数据库里，由数据服务按与官方相同的优先级顺序读本地文件解析：先看 `~/.zcode/v2/provider_config.json` 里有没有精确 modelId 的配置，没有再按 `~/.zcode/v2/runtime/provider/` 下（远端刷新后的）`zcode-builtin.json` 的 `modelMatch` 正则规则匹配，取最后一个带 `contextWindow` 的命中规则。解析结果按文件的修改时间 + 大小做签名缓存，文件变了自动重读；两级都解析不到时，只显示 K 数、不显示百分比。
-- 远端会话轮次的分子由 `remote_fold.py` 在远端算好回传；分母统一由本地根据该轮最后一步使用的模型补上（远端的配置文件版本与本地不同时，这一项可能有展示上的小偏差；官方对 detached workflow child 也做同样的近似）。
+- 分母（模型上下文窗口大小）不在用量数据库里，由数据服务按与官方 `ModelConfigRules.resolve` 相同的顺序读本地文件逐层解析（后命中覆盖先命中）：① `~/.zcode/v2/runtime/provider/` 下（远端刷新后的）`zcode-builtin.json` 的 `modelMatch` 正则规则（全锚定 + 忽略大小写，取最后一个带 `contextWindow` 的命中值——目录追加更具体的新规则即生效，不会被开头 `.*` 的兜底值永久遮蔽）；② 同一文件 `builtinProviderModelRules` 里的精确规则；③ `~/.zcode/v2/provider_config.json` 的 `providerModelRules` 与 `manualProviderModelRules`（设置页里改「上下文窗口」写的就是这里，优先级最高）。其中精确规则必须 providerId + modelId 双匹配——只按模型名匹配会把别家 provider 的窗口套错（曾把个人配置里 `glm-5.3` 的 300K 套到 coding-plan 账号的 `GLM-5.3-Flash` 上，347K 的轮显示成 347K/300K、超过 100%）；该轮没有 provider_id（老数据）时才退化为只按模型名匹配。注意个人规则的 modelId 可以是官方目录里根本没有的自定义模型名（自建网关的自定义 id，如 `gpt-6-luna`）：这类模型没有目录规则可命中，分母只能靠个人规则给出（否则落到开头 `.*` 的兜底值），不要把这种规则当「孤儿规则」删掉。解析结果按文件的修改时间 + 大小做签名缓存，文件变了自动重读；三层都解析不到时，只显示 K 数、不显示百分比。
+- 远端会话轮次的分子由 `remote_fold.py` 在远端算好回传；分母统一由本地根据该轮最后一步使用的模型与 provider 补上（远端的配置文件版本与本地不同时，这一项可能有展示上的小偏差；官方对 detached workflow child 也做同样的近似）。
 
 ## 工作原理
 
@@ -241,6 +241,7 @@ powershell -ExecutionPolicy Bypass -File <仓库目录>\scripts\start-service.ps
 `tools/regress/` 是修改统计逻辑前用来做语义验证的小工具：
 
 - `capture.mjs` 抓取 `/turns` 的数据快照，`diff.mjs` 对两次快照做规范化对比（非 live 条目要求逐个字段严格相等，live 条目容忍随时间变化的字段）。修改 `server.mjs` 的汇总逻辑前后各抓一份快照，就能验证统计结果没有变化。
+- `fold-segments-test.mjs` 折叠语义回归（`node tools/regress/fold-segments-test.mjs`，几秒出结果）：合成一份最小用量库，造出历史故障的现场形状（长流式步/长工具留下的大空洞、崩溃残留、超长进行中工具、窗口作用域、老库缺列降级），同一份数据分别喂给 `server.mjs` 的本地折叠与 `remote_fold.py` 的远端折叠，要求两侧结论一致。走测试端口 3211/3212，用环境变量 `TPS_FOOTER_DB`/`TPS_FOOTER_V2_DIR` 指向合成库与合成配置目录（只给测试用，生产路径不受影响），不碰生产 3117、不读真实配置、不连远端。改折叠逻辑（切段/回并/活性判定/窗口解析）后必须先跑它。
 - `mcp-test.mjs` 验证监督者的生命周期（`node tools/regress/mcp-test.mjs`，需要 3117 端口空闲）。
 - `idle-exit-test.mjs` 验证闲置退场策略全链路（`node tools/regress/idle-exit-test.mjs`，走测试端口 3199/3200，不碰生产；三段式：活跃取数不误退 → 停止取数双双退净 → 模拟重开 ZCode 守护链复活）。
 - `killnode.ps1` 测试前清理环境（结束残留的 node 进程）。

@@ -23,7 +23,7 @@ const t0 = Date.now();
 for (;;) {
   try {
     const h = await get("/healthz");
-    if (h.code === 200 && h.body === "ok") break;
+    if (h.code === 200 && h.body.includes('"ok":true')) break; // /healthz 返回 JSON，不是裸 "ok"
   } catch {}
   if (Date.now() - t0 > waitMaxMs) { console.error("service not ready"); process.exit(1); }
   await new Promise((r) => setTimeout(r, 300));

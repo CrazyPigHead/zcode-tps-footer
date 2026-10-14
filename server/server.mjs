@@ -38,7 +38,7 @@
  *     保持；文件缺失/损坏 = 默认开。
  *
  * 运行时文件：日志在仓库 logs/ 目录（按本脚本位置自动定位；仓库目录须持久保留）。
- * 不依赖任何环境变量。
+ * 除下方测试隔离用覆盖（TPS_FOOTER_PORT / TPS_FOOTER_DB / TPS_FOOTER_V2_DIR）外不读环境变量。
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -51,7 +51,10 @@ import { DatabaseSync } from "node:sqlite";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url)); // <仓库>/server
 const ROOT = path.dirname(HERE); // 仓库根 = 安装根
-const DB = path.join(os.homedir(), ".zcode", "cli", "db", "db.sqlite");
+// 测试覆盖（tools/regress/fold-segments-test.mjs）指向合成库/合成配置目录做隔离；生产环境
+// 从不设置这两项，默认路径与从前一致
+const DB = process.env.TPS_FOOTER_DB || path.join(os.homedir(), ".zcode", "cli", "db", "db.sqlite");
+const V2_DIR = process.env.TPS_FOOTER_V2_DIR || path.join(os.homedir(), ".zcode", "v2");
 const REMOTE_FOLD = path.join(HERE, "remote_fold.py");
 const LOG_PATH = path.join(ROOT, "logs", "server.log");
 const LOG_KEEP_DAYS = 14;
@@ -59,8 +62,11 @@ const LOG_KEEP_DAYS = 14;
 // 测试可用 TPS_FOOTER_PORT 覆盖（正常安装固定 3117；监督者探活同用此变量，两者必须一致）
 const PORT = Number(process.env.TPS_FOOTER_PORT) || 3117;
 const CACHE_TTL_S = 0.5; // 本地库折叠缓存（含 live 轮，步级实时性靠它）
-const LIVE_STALE_MS = 10 * 60 * 1000; // live 判定①：最近一步落库距今（覆盖长流式步）
-const LIVE_TOOL_WINDOW_MS = 60 * 60 * 1000; // live 判定②：该轮仍有新近 running 的工具行（覆盖超长工具）
+const LIVE_STALE_MS = 10 * 60 * 1000; // live 判定①：最近一步落库距今
+const LIVE_MAX_MS = 2 * 60 * 60 * 1000; // live 判定②：尾步起点/运行中工具的活性上限。长流式期间
+// DB 完全安静（实测 126s 采样 session.time_updated/part 全冻结），判活只能用「步已开始多久」；
+// 实测极值单步 54.6min（128k 输出＝服务端单步上限），2h 留足余量。代价：真崩溃（尾 marker 永久
+// 未结算）的幽灵「思考中」行窗口由 10min 放宽到 2h——罕见场景换频繁场景（与 remote_fold.py 同值）
 const FAST_POLL_S = 2.5; // 远端拉取间隔（渲染层活跃 且 该远端有 live 轮——只有这时才可能有秒级新数据）
 const IDLE_REMOTE_POLL_S = 10.0; // 渲染层活跃但该远端无 live 轮：已结算轮不可变，慢节奏探新轮（新轮首现最多迟一个间隔）
 const SLOW_POLL_S = 20.0; // 渲染层不活跃时的拉取间隔
@@ -140,7 +146,7 @@ process.on("exit", (code) => {
 // ---------------------------------------------------------------- 远端配置与状态
 
 // 远端来源：ZCode 桌面端设置（最近会话里的 SSH 目标，打开过新远端会自动出现）
-const SETTING_PATH = path.join(os.homedir(), ".zcode", "v2", "setting.json");
+const SETTING_PATH = path.join(V2_DIR, "setting.json");
 
 function makeRemote(def) {
   return {
@@ -203,27 +209,33 @@ function reloadConfigIfChanged() {
 
 // ---------------------------------------------------------------- 模型上下文窗口（ctx_window 分母）
 //
-// 窗口值不落用量库：官方在内存 registry 里按「个人覆盖层 → 内置目录正则规则」的顺序
-// 叠加解析（packages/provider/src/config/model-config.ts 的 ModelConfigRules.resolve）。
-// 这里按同一次序读盘重建，供上下文百分比用：
-//   1) ~/.zcode/v2/provider_config.json 的 modelConfigRules.providerModelRules[]——精确
-//      modelId（设置页改「上下文窗口」写的就是这里），后写覆盖先写；
-//   2) 远端刷新后的内置目录（~/.zcode/v2/runtime/provider/<平台>/<版本>/endpoint-*/
-//      zcode-builtin.json，取版本最高者）的 config.modelConfigRules.modelRules[]——
-//      modelMatch 正则（/i）按序匹配 modelId，取最后一个带 contextWindow 的命中规则
-//      （如 GLM-5.3-FlashX 不在任何模型列表里，依次命中 `.*`(200000)、`.*glm-5...`(200000)、
-//      `.*glm-5\.3(?:-flash)?...`(1000000)，按最后命中得 1000000——last-match-wins 的意义
-//      就在于此：目录追加更具体的新规则即生效，不会被开头 `.*` 的默认值永久遮蔽）。
-// 两级都解析不到 → null：注入端只显示 K 不显示百分比（与官方 getRenderableTaskUsage
+// 窗口值不落用量库：官方在内存 registry 里按「内置规则先行、个人精确规则最后叠加」的顺序逐条
+// 解析（packages/provider/src/config/model-config.ts 的 ModelConfigRules.resolve），后命中覆盖
+// 先命中。这里按同一次序、同一作用域读盘重建，供上下文百分比用：
+//   1) 内置目录（~/.zcode/v2/runtime/provider/<平台>/<版本>/endpoint-*/zcode-builtin.json，取
+//      版本最高者）的 config.modelConfigRules.modelRules[]——modelMatch 正则按目录顺序匹配
+//      modelId，取最后一个带 contextWindow 的命中规则（如 GLM-5.3-FlashX 不在任何模型列表里，
+//      依次命中 `.*`(200000)、`.*glm-5...`(200000)、`.*glm-5\.3(?:-flash)?...`(1000000)，按
+//      最后命中得 1000000——last-match-wins 的意义就在于此：目录追加更具体的新规则即生效，
+//      不会被开头 `.*` 的默认值永久遮蔽）。同官方 sKt 用全锚定 + /i；
+//   2) 内置目录的 builtinProviderModelRules[]——精确规则，必须 (providerId, modelId) 双匹配
+//      （当前目录里这 30 条都只带 enabled、无窗口值，读取是为目录将来补值即生效）；
+//   3) 个人覆盖层 ~/.zcode/v2/provider_config.json 的 providerModelRules[] +
+//      manualProviderModelRules[]（设置页改「上下文窗口」写的就是这里）——同样必须双匹配，
+//      最后叠加（优先级最高）。
+// 个人规则只按 modelId 匹配是错的：规则自带 providerId（如 glm-5.3@c480de10 = 300K），把它套到
+// coding-plan 账号的 GLM-5.3-Flash 上就会把 347K 的轮显示成 347K/300K（超过 100%，2026-10 实测）。
+// turn 缺 provider_id（老数据）时才退化成「只按 modelId 匹配」的现有口径；modelId 大小写不敏感
+// （库里 `GLM-5.3-Flash` 与配置里的大小写可能不同，官方是严格 !==，这里放宽只为显示层更稳）。
+// 三级都解析不到 → null：注入端只显示 K 不显示百分比（与官方 getRenderableTaskUsage
 // 的 size>0 渲染门槛同语义）。文件按 mtime+size 签名缓存，30s 复查、变更重读；
 // 覆盖层解析失败（应用重写文件撞上半写窗口）时沿用上一份，文件真被删除才清空。
 
-const V2_DIR = path.join(os.homedir(), ".zcode", "v2");
 const PERSONAL_PROVIDER_CONFIG = path.join(V2_DIR, "provider_config.json");
 const RUNTIME_PROVIDER_DIR = path.join(V2_DIR, "runtime", "provider");
 const CTXWIN_RECHECK_MS = 30 * 1000;
 
-const ctxWin = { at: 0, sig: "", exact: new Map(), rules: [] };
+const ctxWin = { at: 0, sig: "", rules: [], builtinProvExact: [], personalExact: [] };
 
 const verKey = (v) => String(v).split(/[.\-_]/);
 function cmpVer(a, b) {
@@ -298,57 +310,76 @@ function loadCtxWinCatalog() {
     .join("|");
   if (sig === ctxWin.sig) return;
   ctxWin.sig = sig;
-  // 覆盖层：精确 modelId -> contextWindow。半写窗口（应用原子重写覆盖层文件时恰被读中）
-  // 解析失败且文件仍在 → 沿用上一份，等下次 mtime 变化重试；文件真被删除 → 清空。
+  // 覆盖层：精确 (providerId, modelId) -> contextWindow。半写窗口（应用原子重写覆盖层文件时
+  // 恰被读中）解析失败且文件仍在 → 沿用上一份，等下次 mtime 变化重试；文件真被删除 → 清空。
   let overlayStatOk = false;
   let overlayParseOk = false;
-  const exactNext = new Map();
+  const personalNext = [];
   try {
     fs.statSync(PERSONAL_PROVIDER_CONFIG);
     overlayStatOk = true;
     const j = JSON.parse(fs.readFileSync(PERSONAL_PROVIDER_CONFIG, "utf8"));
     overlayParseOk = true;
-    for (const r of j?.config?.modelConfigRules?.providerModelRules || []) {
-      const win = r?.config?.properties?.contextWindow;
-      if (typeof win === "number" && win > 0 && r.modelId) {
-        exactNext.set(String(r.modelId).toLowerCase(), win);
+    const mcr = j?.config?.modelConfigRules || {};
+    for (const key of ["providerModelRules", "manualProviderModelRules"]) {
+      for (const r of mcr[key] || []) {
+        const win = r?.config?.properties?.contextWindow;
+        // 无 providerId 的规则在官方引擎里永不命中（undefined !== providerId），一并跳过
+        if (typeof win === "number" && win > 0 && r.modelId && r.providerId) {
+          personalNext.push({ prov: String(r.providerId), model: String(r.modelId).toLowerCase(), win });
+        }
       }
     }
   } catch {
     /* stat 失败 = 文件缺失；parse 失败 = 半写窗口，两者都走下面的选择逻辑 */
   }
-  const exact = overlayParseOk ? exactNext : overlayStatOk ? ctxWin.exact : new Map();
-  const rules = []; // 内置目录：保留目录出现顺序（后命中覆盖先命中）
+  const personalExact = overlayParseOk ? personalNext : overlayStatOk ? ctxWin.personalExact : [];
+  const rules = []; // 内置目录正则：保留目录出现顺序（后命中覆盖先命中）
+  const builtinProvExact = []; // 内置 provider 作用域精确规则（当前目录无窗口值，读取为将来补值即生效）
   if (builtinFile) {
     try {
       const j = JSON.parse(fs.readFileSync(builtinFile, "utf8"));
-      for (const r of j?.config?.modelConfigRules?.modelRules || []) {
+      const mcr = j?.config?.modelConfigRules || {};
+      for (const r of mcr.modelRules || []) {
         const win = r?.config?.properties?.contextWindow;
         if (typeof win !== "number" || win <= 0 || !r.modelMatch) continue;
         try {
-          rules.push({ re: new RegExp(r.modelMatch, "i"), win });
+          // 全锚定 + /i：与官方 sKt 的 ^(?:re)$ 一致（不锚定会让部分匹配悄悄放宽）
+          rules.push({ re: new RegExp(`^(?:${r.modelMatch})$`, "i"), win });
         } catch {
           /* 非法正则跳过 */
         }
+      }
+      for (const r of mcr.builtinProviderModelRules || []) {
+        const win = r?.config?.properties?.contextWindow;
+        if (typeof win !== "number" || win <= 0 || !r.modelId || !r.providerId) continue;
+        builtinProvExact.push({ prov: String(r.providerId), model: String(r.modelId).toLowerCase(), win });
       }
     } catch (e) {
       log(`[CTXWIN-ERR] builtin: ${e && e.message}`);
     }
   }
-  ctxWin.exact = exact;
   ctxWin.rules = rules;
+  ctxWin.builtinProvExact = builtinProvExact;
+  ctxWin.personalExact = personalExact;
   log(
-    `[CTXWIN] exact=${exact.size} rules=${rules.length} builtin=${builtinFile ? path.basename(path.dirname(path.dirname(builtinFile))) : "-"}`,
+    `[CTXWIN] personal=${personalExact.length} builtinProv=${builtinProvExact.length} rules=${rules.length} builtin=${builtinFile ? path.basename(path.dirname(path.dirname(builtinFile))) : "-"}`,
   );
 }
 
-function resolveCtxWindow(modelId) {
+// 分母解析：官方顺序逐条叠加，后命中覆盖先命中；精确规则要 (providerId, modelId) 双匹配。
+// providerId 缺失（老数据）时精确规则退化为只按 modelId 匹配 = 修复前口径，老轮显示不掉。
+function resolveCtxWindow(modelId, providerId) {
   loadCtxWinCatalog();
   if (!modelId) return null;
-  const hit = ctxWin.exact.get(String(modelId).toLowerCase());
-  if (hit != null) return hit;
+  const model = String(modelId);
+  const modelLc = model.toLowerCase();
+  const prov = providerId ? String(providerId) : null;
+  const scoped = (e) => e.model === modelLc && (!prov || e.prov === prov);
   let win = null;
-  for (const r of ctxWin.rules) if (r.re.test(String(modelId))) win = r.win;
+  for (const r of ctxWin.rules) if (r.re.test(model)) win = r.win; // 1) 内置正则
+  for (const e of ctxWin.builtinProvExact) if (scoped(e)) win = e.win; // 2) 内置 provider 精确
+  for (const e of ctxWin.personalExact) if (scoped(e)) win = e.win; // 3) 个人精确（最后叠加，优先最高）
   return win;
 }
 
@@ -367,6 +398,8 @@ function resolveCtxWindow(modelId) {
 // 因此 steps = marker 数 + compact 修正，与轮末账本严格守恒。
 
 const SEGMENT_GAP_MS = 30 * 60 * 1000; // 相邻 marker 间隔超过此值切分段：隔离崩溃残留的半截轮
+const GAP_BRIDGE_EPS_MS = 60 * 1000; // gap 切点回并的桥接容差：前段结算结束（或洞内已完成工具）
+// 距尾段首 marker 的最大间隔——步流水线串行，实测故障轮仅 71ms，60s 留 800 倍余量（与 py 同值）
 
 // 上下文水位（ctx_tokens）：官方口径 input+output，input 缺失按官方回退链退
 // provider_total-output、再退 computed_total。见 foldLocalLocked 的 settle 注释。
@@ -463,13 +496,16 @@ function foldLocalLocked(conn, cut) {
   //      不能重复相加）；取该 turn 最后一条 completed 行 = 轮末真实水位，压缩后下一步
   //      自然回落。input 缺失（0）按官方回退链退 provider_total-output、再退 computed_total。
   //      老 ZCode CLI 的库可能没有三个 token 列——探测缺列就退回无水位模式
-  //      （与上面 INDEXED BY 的探测降级同款），保住原有统计。
-  const hasCtxCols = q("PRAGMA table_info(model_usage)")
-    .filter((r) => ["input_tokens", "provider_total_tokens", "computed_total_tokens"].includes(r.name))
-    .length === 3;
+  //      （与上面 INDEXED BY 的探测降级同款），保住原有统计。provider_id（分母的作用域键，
+  //      见「模型上下文窗口」节）同样探测：缺列则不做作用域匹配，保住老库显示。
+  //      query_source 恒真列传（WHERE 已依赖它）。
+  const muCols = q("PRAGMA table_info(model_usage)");
+  const hasCtxCols = muCols.filter((r) => ["input_tokens", "provider_total_tokens", "computed_total_tokens"].includes(r.name)).length === 3;
+  const hasProvCol = muCols.some((r) => r.name === "provider_id");
   const ctxColsSql = hasCtxCols
     ? ",\n            input_tokens AS in_tok,\n            provider_total_tokens AS prov_total,\n            computed_total_tokens AS comp_total"
     : "";
+  const provColSql = hasProvCol ? ",\n            provider_id AS prov" : "";
   const dec = new Map(); // tid -> [解码ms, 输出tok]
   const modelsByTurn = new Map(); // tid -> [model]
   const settleByMid = new Map(); // assistant_message_id -> 步结算行
@@ -481,7 +517,7 @@ function foldLocalLocked(conn, cut) {
     `SELECT session_id AS sid, turn_id AS tid, assistant_message_id AS mid, model_id AS model,
             status, started_at, completed_at, duration_ms,
             time_to_first_token_ms AS ttft, output_tokens AS out_tok,
-            query_source AS qsrc${ctxColsSql}
+            query_source AS qsrc${provColSql}${ctxColsSql}
      FROM model_usage${startedIdx}
      WHERE started_at >= ? AND query_source IN ('main_turn', 'subagent', 'workflow_child')
      ORDER BY started_at`,
@@ -519,7 +555,9 @@ function foldLocalLocked(conn, cut) {
     compactByTid.set(r.tid, r.n);
   }
 
-  // ---- 运行中工具（含流中工具），按会话分桶（升序），按时间挂到 live 段
+  // ---- 运行中工具（含流中工具），按会话分桶（升序），按时间挂到 live 段。窗口与 live 判定②
+  //      同一上限（LIVE_MAX_MS）：>60min 的长工具曾整体出窗，把活跃轮误判成死轮，并让 phase
+  //      从「工具 运行中」错误回落为「思考/准备」
   const runningBySid = new Map(); // sid -> [{tid, name, start, approval}]
   for (const r of q(
     `SELECT session_id AS sid, turn_id AS tid, tool_name AS name,
@@ -527,7 +565,7 @@ function foldLocalLocked(conn, cut) {
      FROM tool_usage
      WHERE status = 'running' AND started_at >= ?
      ORDER BY started_at`,
-    nowMs - LIVE_TOOL_WINDOW_MS,
+    nowMs - LIVE_MAX_MS,
   )) {
     const arr = runningBySid.get(r.sid) || [];
     runningBySid.set(r.sid, arr);
@@ -561,6 +599,21 @@ function foldLocalLocked(conn, cut) {
   const priorStmt = conn.prepare(
     "SELECT COUNT(*) AS n FROM turn_usage WHERE session_id = ? AND started_at < ?",
   );
+  const doneToolStmt = conn.prepare(
+    // gap 回并的第③条证据（懒执行：只在 gap 切点且①②都不成立时才查一次，正常折叠零开销）
+    `SELECT 1 FROM tool_usage
+     WHERE session_id = ? AND status != 'running'
+       AND COALESCE(completed_at, started_at) BETWEEN ? AND ? LIMIT 1`,
+  );
+  // 段内已结算 marker 的 turn_id 集合（回并证据①；同轮所有步共用 turn_id）
+  const tidsOf = (part) => {
+    const out = new Set();
+    for (const mk of part) {
+      const s = settleByMid.get(mk.mid);
+      if (s && s.tid) out.add(s.tid);
+    }
+    return out;
+  };
 
   // ---- live 段合成：子智能体/workflow 子会话同样合成（其侧边栏与主界面共用
   //      section[data-turn-id] 渲染栈，turn_id 直接匹配）
@@ -568,10 +621,14 @@ function foldLocalLocked(conn, cut) {
   for (const sid of sids) {
     const markers = markerStmt.all(sid, cut);
     if (!markers.length) continue;
-    // 切段取尾段：跨过任一已结算轮起点、或相邻 marker 空洞 > 30min 都开新段；
-    // 尾段即当前 live 轮（轮内 steering 只追加 marker 不换段）。
+    // 切段：跨过任一已结算轮终点、或相邻 marker 空洞 > SEGMENT_GAP_MS 都开新段，尾段即当前
+    // live 轮（轮内 steering 只追加 marker 不换段）。reasons[i] 记「起始 segs[i] 的切点成因」：
+    //   'boundary' 跨过已结算轮终点（现有 crossed 分支，禁止回并）；
+    //   'gap'      大空洞（长流式步/长工具会误触，按证据回并）；
+    // 两者同时满足按 'boundary' 保守归类；首段无切点记 null。
     const boundaries = boundaryStmt.all(sid, cut).map((r) => r.bend);
     const segs = [];
+    const reasons = [null];
     let cur = [markers[0]];
     let bi = 0;
     for (let i = 1; i < markers.length; i++) {
@@ -582,12 +639,43 @@ function foldLocalLocked(conn, cut) {
       if (mk.t0 - prev.t0 > SEGMENT_GAP_MS || crossedBoundary) {
         segs.push(cur);
         cur = [mk];
+        reasons.push(crossedBoundary ? "boundary" : "gap");
       } else {
         cur.push(mk);
       }
     }
     segs.push(cur);
-    const seg = segs[segs.length - 1];
+
+    // ---- gap 切点回并：marker 只在步开始落库，一次超长流式请求（实测单步 54.6min / 128k 输出）
+    //      或一次超长工具在 marker 流上就是个大空洞，会被上面当成崩溃残留误切，把「用时」腰斩
+    //      （故障轮 104min 只显示 20min）。取尾段后从后往前逐段试并，满足任一证据才并（宁可不并、
+    //      不可错并）：
+    //        ① turn_id 一致：前段任一已结算 marker 与尾段已见 turn_id 有交集（最硬证据）；
+    //        ② 结算桥接：前段尾 marker 已结算，且其结束时刻距尾段首 marker ≤ EPS（步流水线
+    //          串行，下一步请求紧跟前步结算；实测故障轮 71ms）；
+    //        ③ 工具桥接：切点附近存在已完成工具（长工具跑完立即发下一步请求）。
+    //      崩溃残留天生无证据（尾步未结算、洞内只有永远 running 的残留行、无 turn_id 可比）→
+    //      保持隔离；异常结束的旧轮被 ②③ 的「紧贴」条件挡掉（残留完成痕迹与新轮首 marker
+    //      之间必然隔着死亡时间 + 用户思考时间 > 60s）。
+    let seg = segs[segs.length - 1];
+    let tids = tidsOf(seg);
+    while (segs.length > 1 && reasons[reasons.length - 1] === "gap") {
+      const prevSeg = segs[segs.length - 2];
+      const prevTids = tidsOf(prevSeg);
+      const s = settleByMid.get(prevSeg[prevSeg.length - 1].mid);
+      const end = s ? s.completed_at ?? (s.started_at || 0) + (s.duration_ms || 0) : null;
+      const bridgeSettle = end != null && Math.abs(seg[0].t0 - end) <= GAP_BRIDGE_EPS_MS;
+      let hit = tids.size > 0 && [...prevTids].some((t) => tids.has(t));
+      if (!hit && !bridgeSettle) hit = doneToolStmt.all(sid, seg[0].t0 - GAP_BRIDGE_EPS_MS, seg[0].t0 + GAP_BRIDGE_EPS_MS).length > 0;
+      if (hit || bridgeSettle) {
+        seg = prevSeg.concat(seg); // 并回后 seg[0] 即下一个待检查切点，循环继续往前试
+        for (const t of prevTids) tids.add(t);
+        segs.pop();
+        reasons.pop();
+      } else {
+        break;
+      }
+    }
     const segStart = seg[0].t0;
 
     // settle 关联：每个 marker 至多一条结算行（model_usage id 按 assistant_message 幂等 upsert）
@@ -615,12 +703,14 @@ function foldLocalLocked(conn, cut) {
     const inFlight = !settleByMid.has(segTail.mid) ? segTail : null;
     // 整段结算且轮已关闭 → turn_usage 已接管，live 退出（最终值原地覆盖）
     if (!inFlight && settledTids.size > 0 && [...settledTids].every((t) => doneIds.has(t))) continue;
-    // 活性：最近 10 分钟有 marker 或结算落库，或窗口内仍有 running 工具
-    //（长工具/长流式步期间无新行落库）。两者皆无 = 崩溃残留的半截轮，不合成。
+    // 活性：最近 10 分钟有 marker 或结算落库，或尾步起点仍在 LIVE_MAX_MS 上限内（长流式期间
+    // DB 完全安静，唯一可用的活性信号就是「步已开始多久」），或窗口内仍有 running 工具
+    //（长工具同样不落库）。三者皆无 = 崩溃残留的半截轮，不合成。
     const freshStep = Math.max(lastEnd, seg[seg.length - 1].t0) >= nowMs - LIVE_STALE_MS;
+    const inFlightFresh = inFlight != null && nowMs - inFlight.t0 <= LIVE_MAX_MS;
     const tools = (runningBySid.get(sid) || []).filter((t) => t.start >= segStart);
     const freshTool = tools.length > 0; // 查询已按窗口过滤
-    if (!freshStep && !freshTool) continue;
+    if (!freshStep && !inFlightFresh && !freshTool) continue;
 
     // 操作态：tool > generating > gap；等待确认优先展示；计时取本批最早 running（批起点）
     let phase = inFlight ? "generating" : "gap";
@@ -659,7 +749,8 @@ function foldLocalLocked(conn, cut) {
       models: modelsByTurn.get(segTid) || [],
       query_source: qsrcBySid.get(sid) || null, // 子会话判定（inject 只对 subagent/workflow_child 追加上下文段）
       ctx_tokens: ctxRow ? ctxRow.ctx : null, // 当前上下文水位；首步结算前为 null（不显示）
-      ctx_window: ctxRow ? resolveCtxWindow(ctxRow.model) : null, // 分母解析不到 = 只显示 K
+      ctx_window: ctxRow ? resolveCtxWindow(ctxRow.model, ctxRow.prov) : null, // 分母，按水位行的 provider 作用域解析
+      ctx_provider: ctxRow ? ctxRow.prov ?? null : null, // 水位行 provider（远端合并在本地回填分母时用）
       tool, // 正在运行的工具（无则 null）
       tool_start_ms: toolStart,
       tool_pending: toolPending,
@@ -686,7 +777,8 @@ function foldLocalLocked(conn, cut) {
         models: modelsByTurn.get(r.turn_id) || [],
         query_source: (ctxRow ? ctxRow.qsrc : qsrcByTid.get(r.turn_id)) || null,
         ctx_tokens: ctxRow ? ctxRow.ctx : null, // 轮末真实上下文水位（该轮最后一步 input+output）
-        ctx_window: ctxRow ? resolveCtxWindow(ctxRow.model) : null,
+        ctx_window: ctxRow ? resolveCtxWindow(ctxRow.model, ctxRow.prov) : null,
+        ctx_provider: ctxRow ? ctxRow.prov ?? null : null,
       };
     });
     out.push(...live);
@@ -947,9 +1039,10 @@ function mergedTurns(limit, sinceQ = 0) {
         ...t,
         host: r.name,
         // 远端不做目录解析（分母），统一由本地按水位行的模型补齐；解析不到保持 null。
-        // ctx_model 是远端折叠导出的「水位行精确模型」，无水位时退 models 去重列表
-        // 末位——仅轮内切换过模型时有纯展示层偏差
-        ctx_window: t.ctx_window ?? resolveCtxWindow(t.ctx_model ?? (t.models || [])[t.models?.length - 1]),
+        // ctx_model/ctx_provider 是远端折叠导出的「水位行精确模型/provider」——精确规则要
+        // (providerId, modelId) 双匹配，两者缺一都可能匹配错（老数据无 provider 时才退化
+        // 成只按模型匹配）；无水位时退 models 去重列表末位，仅轮内切换过模型时有纯展示层偏差
+        ctx_window: t.ctx_window ?? resolveCtxWindow(t.ctx_model ?? (t.models || [])[t.models?.length - 1], t.ctx_provider ?? undefined),
       });
     }
   }
